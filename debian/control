@@ -1,0 +1,53 @@
+Source: strongswan
+Section: net
+Priority: extra
+Maintainer: Martin Willi <martin@strongswan.org>
+Standards-Version: 3.9.2
+Build-Depends: debhelper (>= 7.0.0), libssl-dev (>= 0.9.8), libcap-dev, libcurl4-openssl-dev | libcurl4-gnutls-dev | libcurl4-nss-dev, libldap2-dev, libsqlite3-dev
+Homepage: http://www.strongswan.org
+
+Package: strongswan
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libstrongswan
+Provides: vyatta-ipsec
+Description: IPsec VPN solution.
+ strongSwan is a IPsec based VPN solution for the Linux kernel. It uses the
+ native IPsec stack and runs on any recent 2.6 kernel (no patching required).
+ It supports both, the IKEv1 and the newer IKEv2 protocols.
+ .
+ This package contains the IKEv1/IKEv2 keying daemon charon and command line
+ configuration backend.
+
+Package: strongswan-tools
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libstrongswan
+Description: Additional command line tools for strongSwan.
+ This packages provides pki and other strongSwan utilities.
+
+Package: libstrongswan
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: strongSwan utility and crypto library
+ libstrongswan is the underlying library of charon and other strongSwan
+ components. It is built in a modular way and is extendable through various
+ plugins.
+
+Package: libstrongswan-dev
+Architecture: any
+Priority: optional
+Depends: ${misc:Depends}, libstrongswan (=${binary:Version})
+Section: devel
+Description: strongSwan development headers
+ C header files to develop with libstrongswan.
+
+Package: strongswan-dbg
+Architecture: any
+Section: debug
+Priority: extra
+Depends: ${misc:Depends}, strongswan, libstrongswan
+Description: strongSwan library and binaries - debugging symbols
+ StrongSwan is an IPsec-based VPN solution for the Linux kernel. It uses the
+ native IPsec stack and runs on any recent 2.6 kernel (no patching required).
+ It supports both IKEv1 and the newer IKEv2 protocols.
+ .
+ This package provides the symbols needed for debugging of strongswan.

@@ -1,0 +1,3 @@
+usr/lib/strongswan/scepclient		usr/lib/strongswan/
+usr/bin/pki				usr/bin/
+usr/share/man/man8/scepclient.8		usr/share/man/man8/

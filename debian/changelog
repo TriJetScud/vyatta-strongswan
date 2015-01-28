@@ -1,0 +1,11 @@
+strongswan (5.2.2) unstable; urgency=low
+
+  * Initial import of 5.2.x series into Squeeze
+
+ -- Jeff Leung <jleung@v10networks.ca>  Sun, 25 Jan 2015 07:18:00 +0000
+
+strongswan (5.0.1dr1) unstable; urgency=low
+
+  * New package for strongSwan 5.0 series
+
+ -- Martin Willi <martin@strongswan.org>  Mon, 02 Jul 2012 18:48:55 +0200
