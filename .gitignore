@@ -12,3 +12,10 @@
 *.old
 *.orig
 *.rej
+Makefile
+build
+conf/plugins/*.tmp
+conf/plugins/*.conf
+/config.*
+stamp-h1
+libtool
