@@ -26,7 +26,10 @@
  * 1024 byte is currently sufficient for all operations. Some platform
  * require an enforced aligment to four bytes (e.g. ARM).
  */
-typedef u_char netlink_buf_t[1024] __attribute__((aligned(RTA_ALIGNTO)));
+typedef union {
+	struct nlmsghdr hdr;
+	u_char bytes[1024];
+} netlink_buf_t __attribute__((aligned(RTA_ALIGNTO)));
 
 typedef struct netlink_socket_t netlink_socket_t;
 
@@ -42,7 +45,8 @@ struct netlink_socket_t {
 	 * @param	out 	received netlink message
 	 * @param	out_len	length of the received message
 	 */
-	status_t (*send)(netlink_socket_t *this, struct nlmsghdr *in, struct nlmsghdr **out, size_t *out_len);
+	status_t (*send)(netlink_socket_t *this, struct nlmsghdr *in,
+					 struct nlmsghdr **out, size_t *out_len);
 
 	/**
 	 * Send a netlink message and wait for its acknowledge.
@@ -60,18 +64,33 @@ struct netlink_socket_t {
 /**
  * Create a netlink_socket_t object.
  *
- * @param	protocol	protocol type (e.g. NETLINK_XFRM or NETLINK_ROUTE)
+ * @param protocol	protocol type (e.g. NETLINK_XFRM or NETLINK_ROUTE)
+ * @param names		optional enum names for Netlink messages
+ * @param parallel	support parallel queries on this Netlink socket
  */
-netlink_socket_t *netlink_socket_create(int protocol);
+netlink_socket_t *netlink_socket_create(int protocol, enum_name_t *names,
+										bool parallel);
 
 /**
  * Creates an rtattr and adds it to the given netlink message.
  *
- * @param	hdr			netlink message
- * @param	rta_type	type of the rtattr
- * @param	data		data to add to the rtattr
- * @param	buflen		length of the netlink message buffer
+ * @param hdr			netlink message
+ * @param rta_type		type of the rtattr
+ * @param data			data to add to the rtattr
+ * @param buflen		length of the netlink message buffer
  */
-void netlink_add_attribute(struct nlmsghdr *hdr, int rta_type, chunk_t data, size_t buflen);
+void netlink_add_attribute(struct nlmsghdr *hdr, int rta_type, chunk_t data,
+						   size_t buflen);
+
+/**
+ * Reserve space in a netlink message for given size and type, returning buffer.
+ *
+ * @param hdr			netlink message
+ * @param buflen		size of full netlink buffer
+ * @param type			RTA type
+ * @param len			length of RTA data
+ * @return				buffer to len bytes of attribute data, NULL on error
+ */
+void* netlink_reserve(struct nlmsghdr *hdr, int buflen, int type, int len);
 
 #endif /* KERNEL_NETLINK_SHARED_H_ */

@@ -18,12 +18,12 @@
 #include "x509_pkcs10.h"
 
 #include <library.h>
-#include <debug.h>
+#include <utils/debug.h>
 #include <asn1/oid.h>
 #include <asn1/asn1.h>
 #include <asn1/asn1_parser.h>
 #include <credentials/keys/private_key.h>
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 #include <utils/identification.h>
 
 typedef struct private_x509_pkcs10_t private_x509_pkcs10_t;
@@ -104,37 +104,31 @@ struct private_x509_pkcs10_t {
 extern void x509_parse_generalNames(chunk_t blob, int level0, bool implicit, linked_list_t *list);
 extern chunk_t x509_build_subjectAltNames(linked_list_t *list);
 
-/**
- * Implementation of certificate_t.get_type.
- */
-static certificate_type_t get_type(private_x509_pkcs10_t *this)
+METHOD(certificate_t, get_type, certificate_type_t,
+	private_x509_pkcs10_t *this)
 {
 	return CERT_PKCS10_REQUEST;
 }
 
-/**
- * Implementation of certificate_t.get_subject and get_issuer.
- */
-static identification_t* get_subject(private_x509_pkcs10_t *this)
+METHOD(certificate_t, get_subject, identification_t*,
+	private_x509_pkcs10_t *this)
 {
 	return this->subject;
 }
 
-/**
- * Implementation of certificate_t.has_subject and has_issuer.
- */
-static id_match_t has_subject(private_x509_pkcs10_t *this, identification_t *subject)
+METHOD(certificate_t, has_subject, id_match_t,
+	private_x509_pkcs10_t *this, identification_t *subject)
 {
 	return this->subject->matches(this->subject, subject);
 }
 
-/**
- * Implementation of certificate_t.issued_by.
- */
-static bool issued_by(private_x509_pkcs10_t *this, certificate_t *issuer)
+METHOD(certificate_t, issued_by, bool,
+	private_x509_pkcs10_t *this, certificate_t *issuer,
+	signature_scheme_t *schemep)
 {
 	public_key_t *key;
 	signature_scheme_t scheme;
+	bool valid;
 
 	if (&this->public.interface.interface != issuer)
 	{
@@ -158,24 +152,25 @@ static bool issued_by(private_x509_pkcs10_t *this, certificate_t *issuer)
 	{
 		return FALSE;
 	}
-	return key->verify(key, scheme, this->certificationRequestInfo,
-									this->signature);
+	valid = key->verify(key, scheme, this->certificationRequestInfo,
+						this->signature);
+	if (valid && schemep)
+	{
+		*schemep = scheme;
+	}
+	return valid;
 }
 
-/**
- * Implementation of certificate_t.get_public_key.
- */
-static public_key_t* get_public_key(private_x509_pkcs10_t *this)
+METHOD(certificate_t, get_public_key, public_key_t*,
+	private_x509_pkcs10_t *this)
 {
 	this->public_key->get_ref(this->public_key);
 	return this->public_key;
 }
 
-/**
- * Implementation of certificate_t.get_validity.
- */
-static bool get_validity(private_x509_pkcs10_t *this, time_t *when,
-						 time_t *not_before, time_t *not_after)
+METHOD(certificate_t, get_validity, bool,
+	private_x509_pkcs10_t *this, time_t *when, time_t *not_before,
+	time_t *not_after)
 {
 	if (not_before)
 	{
@@ -188,11 +183,8 @@ static bool get_validity(private_x509_pkcs10_t *this, time_t *when,
 	return TRUE;
 }
 
-/**
- * Implementation of certificate_t.get_encoding.
- */
-static bool get_encoding(private_x509_pkcs10_t *this, cred_encoding_type_t type,
-						 chunk_t *encoding)
+METHOD(certificate_t, get_encoding, bool,
+	private_x509_pkcs10_t *this, cred_encoding_type_t type, chunk_t *encoding)
 {
 	if (type == CERT_ASN1_DER)
 	{
@@ -203,10 +195,8 @@ static bool get_encoding(private_x509_pkcs10_t *this, cred_encoding_type_t type,
 					CRED_PART_PKCS10_ASN1_DER, this->encoding, CRED_PART_END);
 }
 
-/**
- * Implementation of certificate_t.equals.
- */
-static bool equals(private_x509_pkcs10_t *this, certificate_t *other)
+METHOD(certificate_t, equals, bool,
+	private_x509_pkcs10_t *this, certificate_t *other)
 {
 	chunk_t encoding;
 	bool equal;
@@ -232,27 +222,21 @@ static bool equals(private_x509_pkcs10_t *this, certificate_t *other)
 	return equal;
 }
 
-/**
- * Implementation of certificate_t.get_ref
- */
-static private_x509_pkcs10_t* get_ref(private_x509_pkcs10_t *this)
+METHOD(certificate_t, get_ref, certificate_t*,
+	private_x509_pkcs10_t *this)
 {
 	ref_get(&this->ref);
-	return this;
+	return &this->public.interface.interface;
 }
 
-/**
- * Implementation of certificate_t.get_challengePassword.
- */
-static chunk_t get_challengePassword(private_x509_pkcs10_t *this)
+METHOD(pkcs10_t, get_challengePassword, chunk_t,
+	private_x509_pkcs10_t *this)
 {
 	return this->challengePassword;
 }
 
-/**
- * Implementation of pkcs10_t.create_subjectAltName_enumerator.
- */
-static enumerator_t* create_subjectAltName_enumerator(private_x509_pkcs10_t *this)
+METHOD(pkcs10_t, create_subjectAltName_enumerator, enumerator_t*,
+	private_x509_pkcs10_t *this)
 {
 	return this->subjectAltNames->create_enumerator(this->subjectAltNames);
 }
@@ -299,7 +283,7 @@ static bool parse_extension_request(private_x509_pkcs10_t *this, chunk_t blob, i
 				break;
 			case PKCS10_EXTN_CRITICAL:
 				critical = object.len && *object.ptr;
-				DBG2(DBG_LIB, "  %s", critical ? "TRUE" : "FALSE");
+				DBG2(DBG_ASN, "  %s", critical ? "TRUE" : "FALSE");
 				break;
 			case PKCS10_EXTN_VALUE:
 			{
@@ -332,25 +316,25 @@ static bool parse_challengePassword(private_x509_pkcs10_t *this, chunk_t blob, i
 
 	if (blob.len < 2)
 	{
-		DBG1(DBG_LIB, "L%d - challengePassword:  ASN.1 object smaller "
+		DBG1(DBG_ASN, "L%d - challengePassword:  ASN.1 object smaller "
 			 "than 2 octets", level);
 		return FALSE;
 	}
 	tag = *blob.ptr;
 	if (tag < ASN1_UTF8STRING || tag > ASN1_IA5STRING)
 	{
-		DBG1(DBG_LIB, "L%d - challengePassword:  ASN.1 object is not "
+		DBG1(DBG_ASN, "L%d - challengePassword:  ASN.1 object is not "
 			 "a character string", level);
 		return FALSE;
 	}
 	if (asn1_length(&blob) == ASN1_INVALID_LENGTH)
 	{
-		DBG1(DBG_LIB, "L%d - challengePassword:  ASN.1 object has an "
+		DBG1(DBG_ASN, "L%d - challengePassword:  ASN.1 object has an "
 			 "invalid length", level);
 		return FALSE;
 	}
-	DBG2(DBG_LIB, "L%d - challengePassword:", level);
-	DBG4(DBG_LIB, "  '%.*s'", blob.len, blob.ptr);
+	DBG2(DBG_ASN, "L%d - challengePassword:", level);
+	DBG4(DBG_ASN, "  '%.*s'", (int)blob.len, blob.ptr);
 	return TRUE;
 }
 
@@ -408,14 +392,14 @@ static bool parse_certificate_request(private_x509_pkcs10_t *this)
 			case PKCS10_VERSION:
 				if (object.len > 0 && *object.ptr != 0)
 				{
-					DBG1(DBG_LIB, "PKCS#10 certificate request format is "
+					DBG1(DBG_ASN, "PKCS#10 certificate request format is "
 						 "not version 1");
 					goto end;
 				}
 				break;
 			case PKCS10_SUBJECT:
 				this->subject = identification_create_from_encoding(ID_DER_ASN1_DN, object);
-				DBG2(DBG_LIB, "  '%Y'", this->subject);
+				DBG2(DBG_ASN, "  '%Y'", this->subject);
 				break;
 			case PKCS10_SUBJECT_PUBLIC_KEY_INFO:
 				this->public_key = lib->creds->create(lib->creds, CRED_PUBLIC_KEY,
@@ -451,7 +435,7 @@ static bool parse_certificate_request(private_x509_pkcs10_t *this)
 				this->algorithm = asn1_parse_algorithmIdentifier(object, level, NULL);
 				break;
 			case PKCS10_SIGNATURE:
-				this->signature = object;
+				this->signature = chunk_skip(object, 1);
 				break;
 			default:
 				break;
@@ -464,7 +448,7 @@ end:
 	if (success)
 	{
 		/* check if the certificate request is self-signed */
-		if (issued_by(this, &this->public.interface.interface))
+		if (issued_by(this, &this->public.interface.interface, NULL))
 		{
 			this->self_signed = TRUE;
 		}
@@ -477,10 +461,8 @@ end:
 	return success;
 }
 
-/**
- * Implementation of certificate_t.destroy
- */
-static void destroy(private_x509_pkcs10_t *this)
+METHOD(certificate_t, destroy, void,
+	private_x509_pkcs10_t *this)
 {
 	if (ref_put(&this->ref))
 	{
@@ -504,33 +486,32 @@ static void destroy(private_x509_pkcs10_t *this)
  */
 static private_x509_pkcs10_t* create_empty(void)
 {
-	private_x509_pkcs10_t *this = malloc_thing(private_x509_pkcs10_t);
+	private_x509_pkcs10_t *this;
 
-	this->public.interface.interface.get_type = (certificate_type_t (*) (certificate_t*))get_type;
-	this->public.interface.interface.get_subject = (identification_t* (*) (certificate_t*))get_subject;
-	this->public.interface.interface.get_issuer = (identification_t* (*) (certificate_t*))get_subject;
-	this->public.interface.interface.has_subject = (id_match_t (*) (certificate_t*, identification_t*))has_subject;
-	this->public.interface.interface.has_issuer = (id_match_t (*) (certificate_t*, identification_t*))has_subject;
-	this->public.interface.interface.issued_by = (bool (*) (certificate_t*, certificate_t*))issued_by;
-	this->public.interface.interface.get_public_key = (public_key_t* (*) (certificate_t*))get_public_key;
-	this->public.interface.interface.get_validity = (bool (*) (certificate_t*, time_t*, time_t*, time_t*))get_validity;
-	this->public.interface.interface.get_encoding = (bool (*) (certificate_t*,cred_encoding_type_t,chunk_t*))get_encoding;
-	this->public.interface.interface.equals = (bool (*)(certificate_t*, certificate_t*))equals;
-	this->public.interface.interface.get_ref = (certificate_t* (*)(certificate_t*))get_ref;
-	this->public.interface.interface.destroy = (void (*)(certificate_t*))destroy;
-	this->public.interface.get_challengePassword = (chunk_t (*)(pkcs10_t*))get_challengePassword;
-	this->public.interface.create_subjectAltName_enumerator = (enumerator_t* (*)(pkcs10_t*))create_subjectAltName_enumerator;
-
-	this->encoding = chunk_empty;
-	this->certificationRequestInfo = chunk_empty;
-	this->subject = NULL;
-	this->public_key = NULL;
-	this->subjectAltNames = linked_list_create();
-	this->challengePassword = chunk_empty;
-	this->signature = chunk_empty;
-	this->ref = 1;
-	this->self_signed = FALSE;
-	this->parsed = FALSE;
+	INIT(this,
+		.public = {
+			.interface = {
+				.interface = {
+					.get_type = _get_type,
+					.get_subject = _get_subject,
+					.get_issuer = _get_subject,
+					.has_subject = _has_subject,
+					.has_issuer = _has_subject,
+					.issued_by = _issued_by,
+					.get_public_key = _get_public_key,
+					.get_validity = _get_validity,
+					.get_encoding = _get_encoding,
+					.equals = _equals,
+					.get_ref = _get_ref,
+					.destroy = _destroy,
+				},
+				.get_challengePassword = _get_challengePassword,
+				.create_subjectAltName_enumerator = _create_subjectAltName_enumerator,
+			},
+		},
+		.subjectAltNames = linked_list_create(),
+		.ref = 1,
+	);
 
 	return this;
 }

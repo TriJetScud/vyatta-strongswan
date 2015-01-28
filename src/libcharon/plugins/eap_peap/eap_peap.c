@@ -156,17 +156,21 @@ static eap_peap_t *eap_peap_create(private_eap_peap_t * this,
 	tls_t *tls;
 
 	if (is_server && !lib->settings->get_bool(lib->settings,
-							"charon.plugins.eap-peap.request_peer_auth", FALSE))
+								"%s.plugins.eap-peap.request_peer_auth", FALSE,
+								lib->ns))
 	{
 		peer = NULL;
 	}
 	frag_size = lib->settings->get_int(lib->settings,
-					"charon.plugins.eap-peap.fragment_size", MAX_FRAGMENT_LEN);
+					"%s.plugins.eap-peap.fragment_size", MAX_FRAGMENT_LEN,
+					lib->ns);
 	max_msg_count = lib->settings->get_int(lib->settings,
-					"charon.plugins.eap-peap.max_message_count", MAX_MESSAGE_COUNT);
+					"%s.plugins.eap-peap.max_message_count", MAX_MESSAGE_COUNT,
+					lib->ns);
 	include_length = lib->settings->get_bool(lib->settings,
-					"charon.plugins.eap-peap.include_length", FALSE);
- 	tls = tls_create(is_server, server, peer, TLS_PURPOSE_EAP_PEAP, application);
+					"%s.plugins.eap-peap.include_length", FALSE, lib->ns);
+	tls = tls_create(is_server, server, peer, TLS_PURPOSE_EAP_PEAP,
+					 application, NULL);
 	this->tls_eap = tls_eap_create(EAP_PEAP, tls, frag_size, max_msg_count,
 												  include_length);
 	if (!this->tls_eap)
@@ -179,7 +183,7 @@ static eap_peap_t *eap_peap_create(private_eap_peap_t * this,
 }
 
 eap_peap_t *eap_peap_create_server(identification_t *server,
-						  		   identification_t *peer)
+								   identification_t *peer)
 {
 	private_eap_peap_t *eap_peap;
 	eap_method_t *eap_method;

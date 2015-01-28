@@ -24,8 +24,9 @@
 typedef struct tls_handshake_t tls_handshake_t;
 
 #include "tls.h"
-#include "tls_reader.h"
-#include "tls_writer.h"
+
+#include <bio/bio_reader.h>
+#include <bio/bio_writer.h>
 
 /**
  * TLS handshake state machine interface.
@@ -44,7 +45,7 @@ struct tls_handshake_t {
 	 *					- DESTROY_ME if a fatal TLS alert received
 	 */
 	status_t (*process)(tls_handshake_t *this,
-						tls_handshake_type_t type, tls_reader_t *reader);
+						tls_handshake_type_t type, bio_reader_t *reader);
 
 	/**
 	 * Build TLS handshake messages to send out.
@@ -58,21 +59,22 @@ struct tls_handshake_t {
 	 *					- INVALID_STATE if more input to process() required
 	 */
 	status_t (*build)(tls_handshake_t *this,
-					  tls_handshake_type_t *type, tls_writer_t *writer);
+					  tls_handshake_type_t *type, bio_writer_t *writer);
 
 	/**
-	 * Check if the cipher spec for outgoing messages has changed.
+	 * Check if the cipher spec should be changed for outgoing messages.
 	 *
-	 * @return			TRUE if cipher spec changed
+	 * @param inbound	TRUE to check for inbound cipherspec change
+	 * @return			TRUE if cipher spec should be changed
 	 */
-	bool (*cipherspec_changed)(tls_handshake_t *this);
+	bool (*cipherspec_changed)(tls_handshake_t *this, bool inbound);
 
 	/**
-	 * Change the cipher spec for incoming messages.
+	 * Change the cipher for a direction.
 	 *
-	 * @return			TRUE if cipher spec changed
+	 * @param inbound	TRUE to change inbound cipherspec, FALSE for outbound
 	 */
-	bool (*change_cipherspec)(tls_handshake_t *this);
+	void (*change_cipherspec)(tls_handshake_t *this, bool inbound);
 
 	/**
 	 * Check if the finished message was decoded successfully.
@@ -80,6 +82,20 @@ struct tls_handshake_t {
 	 * @return			TRUE if finished message was decoded successfully
 	 */
 	bool (*finished)(tls_handshake_t *this);
+
+	/**
+	 * Get the peer identity authenticated/to authenticate during handshake.
+	 *
+	 * @return			peer identity
+	 */
+	identification_t* (*get_peer_id)(tls_handshake_t *this);
+
+	/**
+	 * Get the server identity authenticated/to authenticate during handshake.
+	 *
+	 * @return			server identity
+	 */
+	identification_t* (*get_server_id)(tls_handshake_t *this);
 
 	/**
 	 * Destroy a tls_handshake_t.

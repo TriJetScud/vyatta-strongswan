@@ -62,9 +62,9 @@ struct private_add_payload_t {
 
 METHOD(listener_t, message, bool,
 	private_add_payload_t *this, ike_sa_t *ike_sa, message_t *message,
-	bool incoming)
+	bool incoming, bool plain)
 {
-	if (!incoming &&
+	if (!incoming && plain &&
 		message->get_request(message) == this->req &&
 		message->get_message_id(message) == this->id)
 	{
@@ -77,8 +77,7 @@ METHOD(listener_t, message, bool,
 		type = atoi(this->type);
 		if (!type)
 		{
-			type = enum_from_name(payload_type_short_names, this->type);
-			if (type == -1)
+			if (!enum_from_name(payload_type_short_names, this->type, &type))
 			{
 				DBG1(DBG_CFG, "unknown payload: '%s', skipped", this->type);
 				return TRUE;
@@ -103,7 +102,7 @@ METHOD(listener_t, message, bool,
 			data = chunk_skip(chunk_create(this->data, strlen(this->data)), 2);
 			data = chunk_from_hex(data, NULL);
 		}
-		else if (this->data && strlen(this->data))
+		else if (strlen(this->data))
 		{
 			data = chunk_clone(chunk_create(this->data, strlen(this->data)));
 		}

@@ -42,7 +42,7 @@ METHOD(job_t, destroy, void,
 	free(this);
 }
 
-METHOD(job_t, execute, void,
+METHOD(job_t, execute, job_requeue_t,
 	private_process_message_job_t *this)
 {
 	ike_sa_t *ike_sa;
@@ -51,7 +51,7 @@ METHOD(job_t, execute, void,
 	/* if this is an unencrypted INFORMATIONAL exchange it is likely a
 	 * connectivity check. */
 	if (this->message->get_exchange_type(this->message) == INFORMATIONAL &&
-		this->message->get_first_payload_type(this->message) != ENCRYPTED)
+		this->message->get_first_payload_type(this->message) != PLV2_ENCRYPTED)
 	{
 		/* theoretically this could also be an error message
 		 * see RFC 4306, section 1.5. */
@@ -59,8 +59,7 @@ METHOD(job_t, execute, void,
 			 this->message->get_source(this->message),
 			 this->message->get_destination(this->message));
 		charon->connect_manager->process_check(charon->connect_manager, this->message);
-		destroy(this);
-		return;
+		return JOB_REQUEUE_NONE;
 	}
 #endif /* ME */
 
@@ -68,9 +67,10 @@ METHOD(job_t, execute, void,
 														 this->message);
 	if (ike_sa)
 	{
-		DBG1(DBG_NET, "received packet: from %#H to %#H",
+		DBG1(DBG_NET, "received packet: from %#H to %#H (%zu bytes)",
 			 this->message->get_source(this->message),
-			 this->message->get_destination(this->message));
+			 this->message->get_destination(this->message),
+			 this->message->get_packet_data(this->message).len);
 		if (ike_sa->process_message(ike_sa, this->message) == DESTROY_ME)
 		{
 			charon->ike_sa_manager->checkin_and_destroy(charon->ike_sa_manager,
@@ -81,7 +81,28 @@ METHOD(job_t, execute, void,
 			charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa);
 		}
 	}
-	destroy(this);
+	return JOB_REQUEUE_NONE;
+}
+
+METHOD(job_t, get_priority, job_priority_t,
+	private_process_message_job_t *this)
+{
+	switch (this->message->get_exchange_type(this->message))
+	{
+		case IKE_AUTH:
+			/* IKE auth is rather expensive and often blocking, low priority */
+			return JOB_PRIO_LOW;
+		case INFORMATIONAL:
+			/* INFORMATIONALs are inexpensive, for DPD we should have low
+			 * reaction times */
+			return JOB_PRIO_HIGH;
+		case IKE_SA_INIT:
+		case CREATE_CHILD_SA:
+		default:
+			/* IKE_SA_INIT is expensive, but we will drop them in the receiver
+			 * if we are overloaded */
+			return JOB_PRIO_MEDIUM;
+	}
 }
 
 /*
@@ -95,6 +116,7 @@ process_message_job_t *process_message_job_create(message_t *message)
 		.public = {
 			.job_interface = {
 				.execute = _execute,
+				.get_priority = _get_priority,
 				.destroy = _destroy,
 			},
 		},

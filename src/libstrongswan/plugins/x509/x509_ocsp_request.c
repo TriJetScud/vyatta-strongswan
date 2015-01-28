@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2008-2009 Martin Willi
- * Copyright (C) 2007 Andreas Steffen
+ * Copyright (C) 2007-2014 Andreas Steffen
  * Hochschule fuer Technik Rapperswil
  * Copyright (C) 2003 Christoph Gysin, Simon Zwahlen
  *
@@ -21,8 +21,8 @@
 #include <asn1/oid.h>
 #include <asn1/asn1.h>
 #include <utils/identification.h>
-#include <utils/linked_list.h>
-#include <debug.h>
+#include <collections/linked_list.h>
+#include <utils/debug.h>
 #include <credentials/certificates/x509.h>
 #include <credentials/keys/private_key.h>
 
@@ -159,22 +159,24 @@ static chunk_t build_requestList(private_x509_ocsp_request_t *this)
 				enumerator_t *enumerator;
 
 				issuer = cert->get_subject(cert);
-				hasher->allocate_hash(hasher, issuer->get_encoding(issuer),
-									  &issuerNameHash);
-				hasher->destroy(hasher);
-
-				enumerator = this->candidates->create_enumerator(this->candidates);
-				while (enumerator->enumerate(enumerator, &x509))
+				if (hasher->allocate_hash(hasher, issuer->get_encoding(issuer),
+										  &issuerNameHash))
 				{
-					chunk_t request, serialNumber;
+					enumerator = this->candidates->create_enumerator(
+															this->candidates);
+					while (enumerator->enumerate(enumerator, &x509))
+					{
+						chunk_t request, serialNumber;
 
-					serialNumber = x509->get_serial(x509);
-					request = build_Request(this, issuerNameHash, issuerKeyHash,
-											serialNumber);
-					list = chunk_cat("mm", list, request);
+						serialNumber = x509->get_serial(x509);
+						request = build_Request(this, issuerNameHash,
+												issuerKeyHash, serialNumber);
+						list = chunk_cat("mm", list, request);
+					}
+					enumerator->destroy(enumerator);
+					chunk_free(&issuerNameHash);
 				}
-				enumerator->destroy(enumerator);
-				chunk_free(&issuerNameHash);
+				hasher->destroy(hasher);
 			}
 		}
 		else
@@ -199,15 +201,15 @@ static chunk_t build_nonce(private_x509_ocsp_request_t *this)
 	rng_t *rng;
 
 	rng = lib->crypto->create_rng(lib->crypto, RNG_WEAK);
-	if (rng)
+	if (!rng || !rng->allocate_bytes(rng, NONCE_LEN, &this->nonce))
 	{
-		rng->allocate_bytes(rng, NONCE_LEN, &this->nonce);
-		rng->destroy(rng);
-		return asn1_wrap(ASN1_SEQUENCE, "cm", ASN1_nonce_oid,
-					asn1_simple_object(ASN1_OCTET_STRING, this->nonce));
+		DBG1(DBG_LIB, "creating OCSP request nonce failed, no RNG found");
+		DESTROY_IF(rng);
+		return chunk_empty;
 	}
-	DBG1(DBG_LIB, "creating OCSP request nonce failed, no RNG found");
-	return chunk_empty;
+	rng->destroy(rng);
+	return asn1_wrap(ASN1_SEQUENCE, "cm", ASN1_nonce_oid,
+				asn1_simple_object(ASN1_OCTET_STRING, this->nonce));
 }
 
 /**
@@ -250,7 +252,7 @@ static chunk_t build_optionalSignature(private_x509_ocsp_request_t *this,
 {
 	int oid;
 	signature_scheme_t scheme;
-	chunk_t certs, signature, encoding;
+	chunk_t certs = chunk_empty, signature, encoding;
 
 	switch (this->key->get_type(this->key))
 	{
@@ -262,6 +264,10 @@ static chunk_t build_optionalSignature(private_x509_ocsp_request_t *this,
 		case KEY_ECDSA:
 			oid = OID_ECDSA_WITH_SHA1;
 			scheme = SIGN_ECDSA_WITH_SHA1_DER;
+			break;
+		case KEY_BLISS:
+			oid = OID_BLISS_WITH_SHA512;
+			scheme = SIGN_BLISS_WITH_SHA512;
 			break;
 		default:
 			DBG1(DBG_LIB, "unable to sign OCSP request, %N signature not "
@@ -304,18 +310,14 @@ static chunk_t build_OCSPRequest(private_x509_ocsp_request_t *this)
 }
 
 
-/**
- * Implementation of certificate_t.get_type
- */
-static certificate_type_t get_type(private_x509_ocsp_request_t *this)
+METHOD(certificate_t, get_type, certificate_type_t,
+	private_x509_ocsp_request_t *this)
 {
 	return CERT_X509_OCSP_REQUEST;
 }
 
-/**
- * Implementation of certificate_t.get_subject
- */
-static identification_t* get_subject(private_x509_ocsp_request_t *this)
+METHOD(certificate_t, get_subject, identification_t*,
+	private_x509_ocsp_request_t *this)
 {
 	certificate_t *ca = (certificate_t*)this->ca;
 
@@ -330,21 +332,16 @@ static identification_t* get_subject(private_x509_ocsp_request_t *this)
 	return ca->get_subject(ca);
 }
 
-/**
- * Implementation of certificate_t.get_issuer
- */
-static identification_t* get_issuer(private_x509_ocsp_request_t *this)
+METHOD(certificate_t, get_issuer, identification_t*,
+	private_x509_ocsp_request_t *this)
 {
 	certificate_t *ca = (certificate_t*)this->ca;
 
 	return ca->get_subject(ca);
 }
 
-/**
- * Implementation of certificate_t.has_subject.
- */
-static id_match_t has_subject(private_x509_ocsp_request_t *this,
-							  identification_t *subject)
+METHOD(certificate_t, has_subject, id_match_t,
+	private_x509_ocsp_request_t *this, identification_t *subject)
 {
 	certificate_t *current;
 	enumerator_t *enumerator;
@@ -363,10 +360,8 @@ static id_match_t has_subject(private_x509_ocsp_request_t *this,
 	return best;
 }
 
-/**
- * Implementation of certificate_t.has_subject.
- */
-static id_match_t has_issuer(private_x509_ocsp_request_t *this,
+METHOD(certificate_t, has_issuer, id_match_t,
+	private_x509_ocsp_request_t *this,
 							 identification_t *issuer)
 {
 	certificate_t *ca = (certificate_t*)this->ca;
@@ -374,28 +369,23 @@ static id_match_t has_issuer(private_x509_ocsp_request_t *this,
 	return ca->has_subject(ca, issuer);
 }
 
-/**
- * Implementation of certificate_t.issued_by
- */
-static bool issued_by(private_x509_ocsp_request_t *this, certificate_t *issuer)
+METHOD(certificate_t, issued_by, bool,
+	private_x509_ocsp_request_t *this, certificate_t *issuer,
+	signature_scheme_t *scheme)
 {
 	DBG1(DBG_LIB, "OCSP request validation not implemented!");
 	return FALSE;
 }
 
-/**
- * Implementation of certificate_t.get_public_key
- */
-static public_key_t* get_public_key(private_x509_ocsp_request_t *this)
+METHOD(certificate_t, get_public_key, public_key_t*,
+	private_x509_ocsp_request_t *this)
 {
 	return NULL;
 }
 
-/**
- * Implementation of x509_cert_t.get_validity.
- */
-static bool get_validity(private_x509_ocsp_request_t *this, time_t *when,
-						 time_t *not_before, time_t *not_after)
+METHOD(certificate_t, get_validity, bool,
+	private_x509_ocsp_request_t *this, time_t *when, time_t *not_before,
+	time_t *not_after)
 {
 	certificate_t *cert;
 
@@ -410,11 +400,9 @@ static bool get_validity(private_x509_ocsp_request_t *this, time_t *when,
 	return cert->get_validity(cert, when, not_before, not_after);
 }
 
-/**
- * Implementation of certificate_t.get_encoding.
- */
-static bool get_encoding(private_x509_ocsp_request_t *this,
-						 cred_encoding_type_t type, chunk_t *encoding)
+METHOD(certificate_t, get_encoding, bool,
+	private_x509_ocsp_request_t *this, cred_encoding_type_t type,
+	chunk_t *encoding)
 {
 	if (type == CERT_ASN1_DER)
 	{
@@ -425,10 +413,8 @@ static bool get_encoding(private_x509_ocsp_request_t *this,
 				CRED_PART_X509_OCSP_REQ_ASN1_DER, this->encoding, CRED_PART_END);
 }
 
-/**
- * Implementation of certificate_t.equals.
- */
-static bool equals(private_x509_ocsp_request_t *this, certificate_t *other)
+METHOD(certificate_t, equals, bool,
+	private_x509_ocsp_request_t *this, certificate_t *other)
 {
 	chunk_t encoding;
 	bool equal;
@@ -454,19 +440,15 @@ static bool equals(private_x509_ocsp_request_t *this, certificate_t *other)
 	return equal;
 }
 
-/**
- * Implementation of certificate_t.asdf
- */
-static private_x509_ocsp_request_t* get_ref(private_x509_ocsp_request_t *this)
+METHOD(certificate_t, get_ref, certificate_t*,
+	private_x509_ocsp_request_t *this)
 {
 	ref_get(&this->ref);
-	return this;
+	return &this->public.interface.interface;
 }
 
-/**
- * Implementation of x509_ocsp_request_t.destroy
- */
-static void destroy(private_x509_ocsp_request_t *this)
+METHOD(certificate_t, destroy, void,
+	private_x509_ocsp_request_t *this)
 {
 	if (ref_put(&this->ref))
 	{
@@ -486,29 +468,30 @@ static void destroy(private_x509_ocsp_request_t *this)
  */
 static private_x509_ocsp_request_t *create_empty()
 {
-	private_x509_ocsp_request_t *this = malloc_thing(private_x509_ocsp_request_t);
+	private_x509_ocsp_request_t *this;
 
-	this->public.interface.interface.get_type = (certificate_type_t (*)(certificate_t *this))get_type;
-	this->public.interface.interface.get_subject = (identification_t* (*)(certificate_t *this))get_subject;
-	this->public.interface.interface.get_issuer = (identification_t* (*)(certificate_t *this))get_issuer;
-	this->public.interface.interface.has_subject = (id_match_t(*)(certificate_t*, identification_t *subject))has_subject;
-	this->public.interface.interface.has_issuer = (id_match_t(*)(certificate_t*, identification_t *issuer))has_issuer;
-	this->public.interface.interface.issued_by = (bool (*)(certificate_t *this, certificate_t *issuer))issued_by;
-	this->public.interface.interface.get_public_key = (public_key_t* (*)(certificate_t *this))get_public_key;
-	this->public.interface.interface.get_validity = (bool(*)(certificate_t*, time_t *when, time_t *, time_t*))get_validity;
-	this->public.interface.interface.get_encoding = (bool(*)(certificate_t*,cred_encoding_type_t,chunk_t*))get_encoding;
-	this->public.interface.interface.equals = (bool(*)(certificate_t*, certificate_t *other))equals;
-	this->public.interface.interface.get_ref = (certificate_t* (*)(certificate_t *this))get_ref;
-	this->public.interface.interface.destroy = (void (*)(certificate_t *this))destroy;
-
-	this->ca = NULL;
-	this->requestor = NULL;
-	this->cert = NULL;
-	this->key = NULL;
-	this->nonce = chunk_empty;
-	this->encoding = chunk_empty;
-	this->candidates = linked_list_create();
-	this->ref = 1;
+	INIT(this,
+		.public = {
+			.interface = {
+				.interface = {
+					.get_type = _get_type,
+					.get_subject = _get_subject,
+					.get_issuer = _get_issuer,
+					.has_subject = _has_subject,
+					.has_issuer = _has_issuer,
+					.issued_by = _issued_by,
+					.get_public_key = _get_public_key,
+					.get_validity = _get_validity,
+					.get_encoding = _get_encoding,
+					.equals = _equals,
+					.get_ref = _get_ref,
+					.destroy = _destroy,
+				},
+			},
+		},
+		.candidates = linked_list_create(),
+		.ref = 1,
+	);
 
 	return this;
 }

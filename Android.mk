@@ -1,29 +1,52 @@
 LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
 
+# the executables that should be installed on the final system have to be added
+# to PRODUCT_PACKAGES in
+#   build/target/product/core.mk
+# possible executables are
+#   starter - allows to control and configure the daemon from the command line
+#   charon - the IKE daemon
+#   scepclient - SCEP client
+
+# if you enable starter or scepclient (see above) uncomment the proper
+# lines here
+# strongswan_BUILD_STARTER := true
+# strongswan_BUILD_SCEPCLIENT := true
+
 # this is the list of plugins that are built into libstrongswan and charon
 # also these plugins are loaded by default (if not changed in strongswan.conf)
-strongswan_PLUGINS := openssl fips-prf random pubkey pkcs1 \
-	pem xcbc hmac kernel-netlink socket-default android \
-	eap-identity eap-mschapv2 eap-md5
+strongswan_CHARON_PLUGINS := android-log openssl fips-prf random nonce pubkey \
+	pkcs1 pkcs8 pem xcbc hmac kernel-netlink socket-default android-dns \
+	stroke eap-identity eap-mschapv2 eap-md5 eap-gtc
 
-# helper macros to only add source files for plugins included in the list above
-# source files are relative to the android.mk that called the macro
-plugin_enabled = $(findstring $(1), $(strongswan_PLUGINS))
-add_plugin = $(if $(call plugin_enabled,$(1)), \
-               $(patsubst $(LOCAL_PATH)/%,%, \
-                 $(wildcard \
-                   $(subst %,$(subst -,_,$(strip $(1))), \
-                     $(LOCAL_PATH)/plugins/%/%*.c \
-                    ) \
-                  ) \
-                ) \
-              )
+ifneq ($(strongswan_BUILD_SCEPCLIENT),)
+# plugins loaded by scepclient
+strongswan_SCEPCLIENT_PLUGINS := openssl curl fips-prf random pkcs1 pkcs7 pem
+endif
+
+strongswan_STARTER_PLUGINS := kernel-netlink
+
+# list of all plugins - used to enable them with the function below
+strongswan_PLUGINS := $(sort $(strongswan_CHARON_PLUGINS) \
+			     $(strongswan_STARTER_PLUGINS) \
+			     $(strongswan_SCEPCLIENT_PLUGINS))
+
+include $(LOCAL_PATH)/Android.common.mk
 
 # includes
 strongswan_PATH := $(LOCAL_PATH)
-libvstr_PATH := external/strongswan-support/vstr/include
+libcurl_PATH := external/strongswan-support/libcurl/include
 libgmp_PATH := external/strongswan-support/gmp
+openssl_PATH := external/openssl/include
+
+# some definitions
+strongswan_DIR := "/system/bin"
+strongswan_SBINDIR := "/system/bin"
+strongswan_PIDDIR := "/data/misc/vpn"
+strongswan_PLUGINDIR := "$(strongswan_IPSEC_DIR)/ipsec"
+strongswan_CONFDIR := "/system/etc"
+strongswan_STRONGSWAN_CONF := "$(strongswan_CONFDIR)/strongswan.conf"
 
 # CFLAGS (partially from a configure run using droid-gcc)
 strongswan_CFLAGS := \
@@ -37,6 +60,7 @@ strongswan_CFLAGS := \
 	-DHAVE_ALLOCA_H \
 	-DHAVE_ALLOCA \
 	-DHAVE_CLOCK_GETTIME \
+	-DHAVE_DLADDR \
 	-DHAVE_PTHREAD_COND_TIMEDWAIT_MONOTONIC \
 	-DHAVE_PRCTL \
 	-DHAVE_LINUX_UDP_H \
@@ -47,18 +71,22 @@ strongswan_CFLAGS := \
 	-DOPENSSL_NO_ECDSA \
 	-DOPENSSL_NO_ECDH \
 	-DOPENSSL_NO_ENGINE \
+	-DCONFIG_H_INCLUDED \
 	-DCAPABILITIES \
 	-DCAPABILITIES_NATIVE \
 	-DMONOLITHIC \
-	-DUSE_VSTR \
+	-DUSE_IKEV1 \
+	-DUSE_IKEV2 \
+	-DUSE_BUILTIN_PRINTF \
+	-DDEBUG \
 	-DROUTING_TABLE=0 \
 	-DROUTING_TABLE_PRIO=220 \
-	-DVERSION=\"4.5.2\" \
-	-DPLUGINS='"$(strongswan_PLUGINS)"' \
-	-DPLUGINDIR=\"/system/bin/ipsec\" \
-	-DIPSEC_DIR=\"/system/bin\" \
-	-DIPSEC_PIDDIR=\"/data/misc/vpn\" \
-	-DSTRONGSWAN_CONF=\"/system/etc/strongswan.conf\" \
+	-DVERSION=\"$(strongswan_VERSION)\" \
+	-DPLUGINDIR=\"$(strongswan_PLUGINDIR)\" \
+	-DIPSEC_DIR=\"$(strongswan_DIR)\" \
+	-DIPSEC_PIDDIR=\"$(strongswan_PIDDIR)\" \
+	-DIPSEC_CONFDIR=\"$(strongswan_CONFDIR)\" \
+	-DSTRONGSWAN_CONF=\"$(strongswan_STRONGSWAN_CONF)\" \
 	-DDEV_RANDOM=\"/dev/random\" \
 	-DDEV_URANDOM=\"/dev/urandom\"
 
@@ -66,9 +94,26 @@ strongswan_CFLAGS := \
 strongswan_CFLAGS += \
 	-DHAVE_IN6ADDR_ANY
 
+strongswan_BUILD := \
+	charon \
+	libcharon \
+	libhydra \
+	libstrongswan \
+	libtncif \
+	libtnccs \
+	libimcv
+
+ifneq ($(strongswan_BUILD_STARTER),)
+strongswan_BUILD += \
+	starter \
+	stroke \
+	ipsec
+endif
+
+ifneq ($(strongswan_BUILD_SCEPCLIENT),)
+strongswan_BUILD += \
+	scepclient
+endif
+
 include $(addprefix $(LOCAL_PATH)/src/,$(addsuffix /Android.mk, \
-		charon \
-		libcharon \
-		libhydra \
-		libstrongswan \
-	))
+		$(sort $(strongswan_BUILD))))

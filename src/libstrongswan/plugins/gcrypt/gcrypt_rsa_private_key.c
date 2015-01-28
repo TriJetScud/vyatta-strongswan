@@ -17,7 +17,7 @@
 
 #include "gcrypt_rsa_private_key.h"
 
-#include <debug.h>
+#include <utils/debug.h>
 #include <asn1/oid.h>
 #include <asn1/asn1.h>
 #include <asn1/asn1_parser.h>
@@ -68,7 +68,7 @@ chunk_t gcrypt_rsa_find_token(gcry_sexp_t sexp, char *name, gcry_sexp_t key)
 			if (key)
 			{
 				/* gcrypt might return more bytes than necessary. Truncate
-				 * to key lenght if key given, or prepend zeros if needed  */
+				 * to key length if key given, or prepend zeros if needed  */
 				len = gcry_pk_get_nbits(key);
 				len = len / 8 + (len % 8 ? 1 : 0);
 				if (len > data.len)
@@ -165,11 +165,11 @@ static bool sign_pkcs1(private_gcrypt_rsa_private_key_t *this,
 		return FALSE;
 	}
 	hasher = lib->crypto->create_hasher(lib->crypto, hash_algorithm);
-	if (!hasher)
+	if (!hasher || !hasher->allocate_hash(hasher, data, &hash))
 	{
+		DESTROY_IF(hasher);
 		return FALSE;
 	}
-	hasher->allocate_hash(hasher, data, &hash);
 	hasher->destroy(hasher);
 
 	err = gcry_sexp_build(&in, NULL, "(data(flags pkcs1)(hash %s %b))",
@@ -504,7 +504,7 @@ gcrypt_rsa_private_key_t *gcrypt_rsa_private_key_load(key_type_t type,
 													  va_list args)
 {
 	private_gcrypt_rsa_private_key_t *this;
-	chunk_t n, e, d, p, q, exp, u;
+	chunk_t n, e, d, p, q, u;
 	gcry_error_t err;
 
 	n = e = d = p = q = u = chunk_empty;
@@ -531,7 +531,7 @@ gcrypt_rsa_private_key_t *gcrypt_rsa_private_key_load(key_type_t type,
 			case BUILD_RSA_EXP1:
 			case BUILD_RSA_EXP2:
 				/* not required for gcrypt */
-				exp = va_arg(args, chunk_t);
+				va_arg(args, chunk_t);
 				continue;
 			case BUILD_RSA_COEFF:
 				u = va_arg(args, chunk_t);

@@ -156,9 +156,9 @@ static void blink_activity(private_led_listener_t *this)
 		{
 			set_led(this->activity, this->activity_max);
 		}
-		lib->scheduler->schedule_job_ms(lib->scheduler,
-			(job_t*)callback_job_create((callback_job_cb_t)reset_activity_led,
-										this, NULL, NULL), this->blink_time);
+		lib->scheduler->schedule_job_ms(lib->scheduler, (job_t*)
+			callback_job_create_with_prio((callback_job_cb_t)reset_activity_led,
+						this, NULL, NULL, JOB_PRIO_CRITICAL), this->blink_time);
 		this->mutex->unlock(this->mutex);
 	}
 }
@@ -189,9 +189,9 @@ METHOD(listener_t, ike_state_change, bool,
 
 METHOD(listener_t, message_hook, bool,
 	private_led_listener_t *this, ike_sa_t *ike_sa,
-	message_t *message, bool incoming)
+	message_t *message, bool incoming, bool plain)
 {
-	if (incoming || message->get_request(message))
+	if (plain && (incoming || message->get_request(message)))
 	{
 		blink_activity(this);
 	}
@@ -230,11 +230,12 @@ led_listener_t *led_listener_create()
 		},
 		.mutex = mutex_create(MUTEX_TYPE_DEFAULT),
 		.blink_time = lib->settings->get_int(lib->settings,
-				"charon.plugins.led.blink_time", 50),
+								"%s.plugins.led.blink_time", 50, lib->ns),
 	);
 
 	this->activity = open_led(lib->settings->get_str(lib->settings,
-				"charon.plugins.led.activity_led", NULL), &this->activity_max);
+								"%s.plugins.led.activity_led", NULL, lib->ns),
+								&this->activity_max);
 	set_led(this->activity, 0);
 
 	return &this->public;

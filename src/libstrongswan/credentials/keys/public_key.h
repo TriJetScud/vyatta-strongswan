@@ -1,6 +1,7 @@
 /*
  * Copyright (C) 2007 Martin Willi
- * Hochschule fuer Technik Rapperswil
+ * Copyright (C) 2014 Andreas Steffen
+ * HSR Hochschule fuer Technik Rapperswil
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -42,6 +43,8 @@ enum key_type_t {
 	KEY_ECDSA = 2,
 	/** DSA */
 	KEY_DSA   = 3,
+	/** BLISS */
+	KEY_BLISS = 4,
 	/** ElGamal, ... */
 };
 
@@ -90,6 +93,8 @@ enum signature_scheme_t {
 	SIGN_ECDSA_384,
 	/** ECDSA on the P-521 curve with SHA-512 as in RFC 4754           */
 	SIGN_ECDSA_521,
+	/** BLISS with SHA-512                                             */
+	SIGN_BLISS_WITH_SHA512,
 };
 
 /**
@@ -151,7 +156,7 @@ struct public_key_t {
 	 * @param scheme	encryption scheme to use
 	 * @param plain		chunk containing plaintext data
 	 * @param crypto	where to allocate encrypted data
-	 * @return 			TRUE if data successfully encrypted
+	 * @return			TRUE if data successfully encrypted
 	 */
 	bool (*encrypt)(public_key_t *this, encryption_scheme_t scheme,
 					chunk_t plain, chunk_t *crypto);
@@ -192,7 +197,7 @@ struct public_key_t {
 	/**
 	 * Get the key in an encoded form as a chunk.
 	 *
-	 * @param type		type of the encoding, one of PRIVKEY_*
+	 * @param type		type of the encoding, one of PUBKEY_*
 	 * @param encoding	encoding of the key, allocated
 	 * @return			TRUE if encoding supported
 	 */
@@ -215,20 +220,20 @@ struct public_key_t {
 /**
  * Generic public key equals() implementation, usable by implementors.
  *
- * @param this			first key to compare
- * @param other			second key to compare
+ * @param public		public key to check
+ * @param other			key to compare
  * @return				TRUE if this is equal to other
  */
-bool public_key_equals(public_key_t *this, public_key_t *other);
+bool public_key_equals(public_key_t *public, public_key_t *other);
 
 /**
  * Generic public key has_fingerprint() implementation, usable by implementors.
  *
- * @param this			key to check fingerprint
+ * @param public		public key to check
  * @param fingerprint	fingerprint to check
  * @return				TRUE if key has given fingerprint
  */
-bool public_key_has_fingerprint(public_key_t *this, chunk_t fingerprint);
+bool public_key_has_fingerprint(public_key_t *public, chunk_t fingerprint);
 
 /**
  * Conversion of ASN.1 signature or hash OID to signature scheme.

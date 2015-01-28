@@ -42,20 +42,29 @@ struct private_load_tester_listener_t {
 	u_int established;
 
 	/**
+	 * Number of terminated SAs
+	 */
+	u_int terminated;
+
+	/**
 	 * Shutdown the daemon if we have established this SA count
 	 */
 	u_int shutdown_on;
+
+	/**
+	 * Configuration backend
+	 */
+	load_tester_config_t *config;
 };
 
-/**
- * Implementation of listener_t.ike_state_change
- */
-static bool ike_state_change(private_load_tester_listener_t *this,
-							 ike_sa_t *ike_sa, ike_sa_state_t state)
+METHOD(listener_t, ike_updown, bool,
+	private_load_tester_listener_t *this, ike_sa_t *ike_sa, bool up)
 {
-	if (state == IKE_ESTABLISHED)
+	if (up)
 	{
 		ike_sa_id_t *id = ike_sa->get_id(ike_sa);
+
+		this->established++;
 
 		if (this->delete_after_established)
 		{
@@ -65,38 +74,62 @@ static bool ike_state_change(private_load_tester_listener_t *this,
 
 		if (id->is_initiator(id))
 		{
-			if (this->shutdown_on == ++this->established)
+			if (this->shutdown_on == this->established)
 			{
 				DBG1(DBG_CFG, "load-test complete, raising SIGTERM");
 				kill(0, SIGTERM);
 			}
 		}
 	}
+	else
+	{
+		this->terminated++;
+	}
 	return TRUE;
 }
 
-/**
- * Implementation of load_tester_listener_t.destroy
- */
-static void destroy(private_load_tester_listener_t *this)
+METHOD(listener_t, ike_state_change, bool,
+	private_load_tester_listener_t *this, ike_sa_t *ike_sa, ike_sa_state_t state)
+{
+	if (state == IKE_DESTROYING)
+	{
+		this->config->delete_ip(this->config, ike_sa->get_my_host(ike_sa));
+	}
+	return TRUE;
+}
+
+METHOD(load_tester_listener_t, get_established, u_int,
+	private_load_tester_listener_t *this)
+{
+	return this->established - this->terminated;
+}
+
+METHOD(load_tester_listener_t, destroy, void,
+	private_load_tester_listener_t *this)
 {
 	free(this);
 }
 
-load_tester_listener_t *load_tester_listener_create(u_int shutdown_on)
+load_tester_listener_t *load_tester_listener_create(u_int shutdown_on,
+													load_tester_config_t *config)
 {
-	private_load_tester_listener_t *this = malloc_thing(private_load_tester_listener_t);
+	private_load_tester_listener_t *this;
 
-	memset(&this->public.listener, 0, sizeof(listener_t));
-	this->public.listener.ike_state_change = (void*)ike_state_change;
-	this->public.destroy = (void(*) (load_tester_listener_t*))destroy;
-
-	this->delete_after_established = lib->settings->get_bool(lib->settings,
-				"charon.plugins.load-tester.delete_after_established", FALSE);
-
-	this->shutdown_on = shutdown_on;
-	this->established = 0;
+	INIT(this,
+		.public = {
+			.listener = {
+				.ike_updown = _ike_updown,
+				.ike_state_change = _ike_state_change,
+			},
+			.get_established = _get_established,
+			.destroy = _destroy,
+		},
+		.delete_after_established = lib->settings->get_bool(lib->settings,
+					"%s.plugins.load-tester.delete_after_established", FALSE,
+					lib->ns),
+		.shutdown_on = shutdown_on,
+		.config = config,
+	);
 
 	return &this->public;
 }
-

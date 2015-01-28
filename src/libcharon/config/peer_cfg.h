@@ -29,13 +29,11 @@ typedef struct peer_cfg_t peer_cfg_t;
 
 #include <library.h>
 #include <utils/identification.h>
-#include <utils/enumerator.h>
+#include <collections/enumerator.h>
 #include <selectors/traffic_selector.h>
 #include <config/proposal.h>
 #include <config/ike_cfg.h>
 #include <config/child_cfg.h>
-#include <sa/authenticators/authenticator.h>
-#include <sa/authenticators/eap/eap_method.h>
 #include <credentials/auth_cfg.h>
 
 /**
@@ -65,11 +63,13 @@ extern enum_name_t *cert_policy_names;
  * Uniqueness of an IKE_SA, used to drop multiple connections with one peer.
  */
 enum unique_policy_t {
-	/** do not check for client uniqueness */
+	/** never check for client uniqueness */
+	UNIQUE_NEVER,
+	/** only check for client uniqueness when receiving an INITIAL_CONTACT */
 	UNIQUE_NO,
-	/** replace unique IKE_SAs if new ones get established */
+	/** replace existing IKE_SAs when new ones get established by a client */
 	UNIQUE_REPLACE,
-	/** keep existing IKE_SAs, close the new ones on connection attept */
+	/** keep existing IKE_SAs, close the new ones on connection attempt */
 	UNIQUE_KEEP,
 };
 
@@ -82,8 +82,9 @@ extern enum_name_t *unique_policy_names;
  * Configuration of a peer, specified by IDs.
  *
  * The peer config defines a connection between two given IDs. It contains
- * exactly one ike_cfg_t, which is use for initiation. Additionally, it contains
- * multiple child_cfg_t defining which CHILD_SAs are allowed for this peer.
+ * exactly one ike_cfg_t, which is used for initiation. Additionally, it
+ * contains multiple child_cfg_t defining which CHILD_SAs are allowed for this
+ * peer.
  * @verbatim
                           +-------------------+        +---------------+
    +---------------+      |     peer_cfg      |      +---------------+ |
@@ -110,7 +111,7 @@ extern enum_name_t *unique_policy_names;
  * peer. Each config is enforced using the multiple authentication extension
  * (RFC4739).
  * The remote authentication configs are handled as constraints. The peer has
- * to fullfill each of these rules (using multiple authentication, in any order)
+ * to fulfill each of these rules (using multiple authentication, in any order)
  * to gain access to the configuration.
  */
 struct peer_cfg_t {
@@ -127,9 +128,9 @@ struct peer_cfg_t {
 	/**
 	 * Get the IKE version to use for initiating.
 	 *
-	 * @return 				IKE major version
+	 * @return				IKE major version
 	 */
-	u_int (*get_ike_version)(peer_cfg_t *this);
+	ike_version_t (*get_ike_version)(peer_cfg_t *this);
 
 	/**
 	 * Get the IKE config to use for initiaton.
@@ -164,18 +165,18 @@ struct peer_cfg_t {
 	 *
 	 * @param my_ts			TS for local side
 	 * @param other_ts		TS for remote side
-	 * @param my_host		host to narrow down dynamic TS for local side
-	 * @param other_host	host to narrow down dynamic TS for remote side
+	 * @param my_hosts		hosts to narrow down dynamic TS for local side
+	 * @param other_hosts	hosts to narrow down dynamic TS for remote side
 	 * @return				selected CHILD config, or NULL if no match found
 	 */
-	child_cfg_t* (*select_child_cfg) (peer_cfg_t *this, linked_list_t *my_ts,
-									  linked_list_t *other_ts, host_t *my_host,
-									  host_t *other_host);
+	child_cfg_t* (*select_child_cfg) (peer_cfg_t *this,
+							linked_list_t *my_ts, linked_list_t *other_ts,
+							linked_list_t *my_hosts, linked_list_t *other_hosts);
 
 	/**
 	 * Add an authentication config to the peer configuration.
 	 *
-	 * @param config		config to add
+	 * @param cfg			config to add
 	 * @param local			TRUE for local rules, FALSE for remote constraints
 	 */
 	void (*add_auth_cfg)(peer_cfg_t *this, auth_cfg_t *cfg, bool local);
@@ -189,7 +190,7 @@ struct peer_cfg_t {
 	enumerator_t* (*create_auth_cfg_enumerator)(peer_cfg_t *this, bool local);
 
 	/**
-	 * Should be sent a certificate for this connection?
+	 * Should a certificate be sent for this connection?
 	 *
 	 * @return			certificate sending policy
 	 */
@@ -210,18 +211,20 @@ struct peer_cfg_t {
 	u_int32_t (*get_keyingtries) (peer_cfg_t *this);
 
 	/**
-	 * Get a time to start rekeying (is randomized with jitter).
+	 * Get a time to start rekeying.
 	 *
+	 * @param jitter	remove a jitter value to randomize time
 	 * @return			time in s when to start rekeying, 0 disables rekeying
 	 */
-	u_int32_t (*get_rekey_time)(peer_cfg_t *this);
+	u_int32_t (*get_rekey_time)(peer_cfg_t *this, bool jitter);
 
 	/**
-	 * Get a time to start reauthentication (is randomized with jitter).
+	 * Get a time to start reauthentication.
 	 *
+	 * @param jitter	remove a jitter value to randomize time
 	 * @return			time in s when to start reauthentication, 0 disables it
 	 */
-	u_int32_t (*get_reauth_time)(peer_cfg_t *this);
+	u_int32_t (*get_reauth_time)(peer_cfg_t *this, bool jitter);
 
 	/**
 	 * Get the timeout of a rekeying/reauthenticating SA.
@@ -238,6 +241,20 @@ struct peer_cfg_t {
 	bool (*use_mobike) (peer_cfg_t *this);
 
 	/**
+	 * Use/Accept aggressive mode with IKEv1?.
+	 *
+	 * @return			TRUE to use aggressive mode
+	 */
+	bool (*use_aggressive)(peer_cfg_t *this);
+
+	/**
+	 * Use pull or push mode for mode config?
+	 *
+	 * @return			TRUE to use pull, FALSE to use push mode
+	 */
+	bool (*use_pull_mode)(peer_cfg_t *this);
+
+	/**
 	 * Get the DPD check interval.
 	 *
 	 * @return			dpd_delay in seconds
@@ -245,23 +262,41 @@ struct peer_cfg_t {
 	u_int32_t (*get_dpd) (peer_cfg_t *this);
 
 	/**
-	 * Get a virtual IP for the local peer.
+	 * Get the DPD timeout interval (IKEv1 only)
 	 *
-	 * If no virtual IP should be used, NULL is returned. %any means to request
-	 * a virtual IP using configuration payloads. A specific address is also
-	 * used for a request and may be changed by the server.
-	 *
-	 * @param suggestion	NULL, %any or specific
-	 * @return				virtual IP, %any or NULL
+	 * @return			dpd_timeout in seconds
 	 */
-	host_t* (*get_virtual_ip) (peer_cfg_t *this);
+	u_int32_t (*get_dpd_timeout) (peer_cfg_t *this);
 
 	/**
-	 * Get the name of the pool to acquire configuration attributes from.
+	 * Add a virtual IP to request as initiator.
 	 *
-	 * @return				pool name, NULL if none defined
+	 * @param vip			virtual IP to request, may be %any or %any6
 	 */
-	char* (*get_pool)(peer_cfg_t *this);
+	void (*add_virtual_ip)(peer_cfg_t *this, host_t *vip);
+
+	/**
+	 * Create an enumerator over virtual IPs to request.
+	 *
+	 * The returned enumerator enumerates over IPs added with add_virtual_ip().
+	 *
+	 * @return				enumerator over host_t*
+	 */
+	enumerator_t* (*create_virtual_ip_enumerator)(peer_cfg_t *this);
+
+	/**
+	 * Add a pool name this configuration uses to select virtual IPs.
+	 *
+	 * @param name			pool name to use for virtual IP lookup
+	 */
+	void (*add_pool)(peer_cfg_t *this, char *name);
+
+	/**
+	 * Create an enumerator over pool names of this config.
+	 *
+	 * @return				enumerator over char*
+	 */
+	enumerator_t* (*create_pool_enumerator)(peer_cfg_t *this);
 
 #ifdef ME
 	/**
@@ -328,30 +363,31 @@ struct peer_cfg_t {
  * (rekeylifetime - random(0, jitter)).
  *
  * @param name				name of the peer_cfg
- * @param ike_version		which IKE version we sould use for this peer
  * @param ike_cfg			IKE config to use when acting as initiator
  * @param cert_policy		should we send a certificate payload?
  * @param unique			uniqueness of an IKE_SA
  * @param keyingtries		how many keying tries should be done before giving up
  * @param rekey_time		timeout before starting rekeying
  * @param reauth_time		timeout before starting reauthentication
- * @param jitter_time		timerange to randomly substract from rekey/reauth time
+ * @param jitter_time		timerange to randomly subtract from rekey/reauth time
  * @param over_time			maximum overtime before closing a rekeying/reauth SA
  * @param mobike			use MOBIKE (RFC4555) if peer supports it
+ * @param aggressive		use/accept aggressive mode with IKEv1
+ * @param pull_mode			TRUE to use modeconfig pull, FALSE for push
  * @param dpd				DPD check interval, 0 to disable
- * @param virtual_ip		virtual IP for local host, or NULL
- * @param pool				pool name to get configuration attributes from, or NULL
+ * @param dpd_timeout		DPD timeout interval (IKEv1 only), if 0 default applies
  * @param mediation			TRUE if this is a mediation connection
  * @param mediated_by		peer_cfg_t of the mediation connection to mediate through
  * @param peer_id			ID that identifies our peer at the mediation server
- * @return 					peer_cfg_t object
+ * @return					peer_cfg_t object
  */
-peer_cfg_t *peer_cfg_create(char *name, u_int ike_version, ike_cfg_t *ike_cfg,
-							cert_policy_t cert_policy, unique_policy_t unique,
-							u_int32_t keyingtries, u_int32_t rekey_time,
-							u_int32_t reauth_time, u_int32_t jitter_time,
-							u_int32_t over_time, bool mobike, u_int32_t dpd,
-							host_t *virtual_ip, char *pool,
+peer_cfg_t *peer_cfg_create(char *name,
+							ike_cfg_t *ike_cfg, cert_policy_t cert_policy,
+							unique_policy_t unique, u_int32_t keyingtries,
+							u_int32_t rekey_time, u_int32_t reauth_time,
+							u_int32_t jitter_time, u_int32_t over_time,
+							bool mobike, bool aggressive, bool pull_mode,
+							u_int32_t dpd, u_int32_t dpd_timeout,
 							bool mediation, peer_cfg_t *mediated_by,
 							identification_t *peer_id);
 

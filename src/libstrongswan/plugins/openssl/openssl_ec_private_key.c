@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2008-2012 Tobias Brunner
  * Copyright (C) 2009 Martin Willi
- * Copyright (C) 2008 Tobias Brunner
  * Hochschule fuer Technik Rapperswil
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -16,13 +16,13 @@
 
 #include <openssl/opensslconf.h>
 
-#ifndef OPENSSL_NO_EC
+#ifndef OPENSSL_NO_ECDSA
 
 #include "openssl_ec_private_key.h"
 #include "openssl_ec_public_key.h"
 #include "openssl_util.h"
 
-#include <debug.h>
+#include <utils/debug.h>
 
 #include <openssl/evp.h>
 #include <openssl/ecdsa.h>
@@ -181,17 +181,7 @@ METHOD(private_key_t, decrypt, bool,
 METHOD(private_key_t, get_keysize, int,
 	private_openssl_ec_private_key_t *this)
 {
-	switch (EC_GROUP_get_curve_name(EC_KEY_get0_group(this->ec)))
-	{
-		case NID_X9_62_prime256v1:
-			return 256;
-		case NID_secp384r1:
-			return 384;
-		case NID_secp521r1:
-			return 521;
-		default:
-			return 0;
-	}
+	return EC_GROUP_get_degree(EC_KEY_get0_group(this->ec));
 }
 
 METHOD(private_key_t, get_type, key_type_t,
@@ -371,14 +361,17 @@ openssl_ec_private_key_t *openssl_ec_private_key_load(key_type_t type,
 													  va_list args)
 {
 	private_openssl_ec_private_key_t *this;
-	chunk_t blob = chunk_empty;
+	chunk_t par = chunk_empty, key = chunk_empty;
 
 	while (TRUE)
 	{
 		switch (va_arg(args, builder_part_t))
 		{
+			case BUILD_BLOB_ALGID_PARAMS:
+				par = va_arg(args, chunk_t);
+				continue;
 			case BUILD_BLOB_ASN1_DER:
-				blob = va_arg(args, chunk_t);
+				key = va_arg(args, chunk_t);
 				continue;
 			case BUILD_END:
 				break;
@@ -389,18 +382,35 @@ openssl_ec_private_key_t *openssl_ec_private_key_load(key_type_t type,
 	}
 
 	this = create_empty();
-	this->ec = d2i_ECPrivateKey(NULL, (const u_char**)&blob.ptr, blob.len);
-	if (!this->ec)
+
+	if (par.ptr)
 	{
-		destroy(this);
-		return NULL;
+		this->ec = d2i_ECParameters(NULL, (const u_char**)&par.ptr, par.len);
+		if (!this->ec)
+		{
+			goto error;
+		}
+		if (!d2i_ECPrivateKey(&this->ec, (const u_char**)&key.ptr, key.len))
+		{
+			goto error;
+		}
+	}
+	else
+	{
+		this->ec = d2i_ECPrivateKey(NULL, (const u_char**)&key.ptr, key.len);
+		if (!this->ec)
+		{
+			goto error;
+		}
 	}
 	if (!EC_KEY_check_key(this->ec))
 	{
-		destroy(this);
-		return NULL;
+		goto error;
 	}
 	return &this->public;
-}
-#endif /* OPENSSL_NO_EC */
 
+error:
+	destroy(this);
+	return NULL;
+}
+#endif /* OPENSSL_NO_ECDSA */

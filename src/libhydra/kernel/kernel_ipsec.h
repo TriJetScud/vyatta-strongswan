@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2006-2010 Tobias Brunner
+ * Copyright (C) 2006-2012 Tobias Brunner
  * Copyright (C) 2006 Daniel Roethlisberger
  * Copyright (C) 2005-2006 Martin Willi
  * Copyright (C) 2005 Jan Hutter
@@ -24,132 +24,13 @@
 #ifndef KERNEL_IPSEC_H_
 #define KERNEL_IPSEC_H_
 
-typedef enum ipsec_mode_t ipsec_mode_t;
-typedef enum policy_dir_t policy_dir_t;
-typedef enum policy_type_t policy_type_t;
-typedef enum ipcomp_transform_t ipcomp_transform_t;
 typedef struct kernel_ipsec_t kernel_ipsec_t;
-typedef struct ipsec_sa_cfg_t ipsec_sa_cfg_t;
-typedef struct lifetime_cfg_t lifetime_cfg_t;
-typedef struct mark_t mark_t;
 
-#include <utils/host.h>
-#include <crypto/prf_plus.h>
+#include <networking/host.h>
+#include <ipsec/ipsec_types.h>
 #include <selectors/traffic_selector.h>
-
-/**
- * Mode of an IPsec SA.
- */
-enum ipsec_mode_t {
-	/** transport mode, no inner address */
-	MODE_TRANSPORT = 1,
-	/** tunnel mode, inner and outer addresses */
-	MODE_TUNNEL,
-	/** BEET mode, tunnel mode but fixed, bound inner addresses */
-	MODE_BEET,
-};
-
-/**
- * enum names for ipsec_mode_t.
- */
-extern enum_name_t *ipsec_mode_names;
-
-/**
- * Direction of a policy. These are equal to those
- * defined in xfrm.h, but we want to stay implementation
- * neutral here.
- */
-enum policy_dir_t {
-	/** Policy for inbound traffic */
-	POLICY_IN = 0,
-	/** Policy for outbound traffic */
-	POLICY_OUT = 1,
-	/** Policy for forwarded traffic */
-	POLICY_FWD = 2,
-};
-
-/**
- * enum names for policy_dir_t.
- */
-extern enum_name_t *policy_dir_names;
-
-/**
- * Type of a policy.
- */
-enum policy_type_t {
-	/** Normal IPsec policy */
-	POLICY_IPSEC = 1,
-	/** Passthrough policy (traffic is ignored by IPsec) */
-	POLICY_PASS,
-	/** Drop policy (traffic is discarded) */
-	POLICY_DROP,
-};
-
-/**
- * IPComp transform IDs, as in RFC 4306
- */
-enum ipcomp_transform_t {
-	IPCOMP_NONE = 0,
-	IPCOMP_OUI = 1,
-	IPCOMP_DEFLATE = 2,
-	IPCOMP_LZS = 3,
-	IPCOMP_LZJH = 4,
-};
-
-/**
- * enum strings for ipcomp_transform_t.
- */
-extern enum_name_t *ipcomp_transform_names;
-
-/**
- * This struct contains details about IPsec SA(s) tied to a policy.
- */
-struct ipsec_sa_cfg_t {
-	/** mode of SA (tunnel, transport) */
-	ipsec_mode_t mode;
-	/** unique ID */
-	u_int32_t reqid;
-	/** details about ESP/AH */
-	struct {
-		/** TRUE if this protocol is used */
-		bool use;
-		/** SPI for ESP/AH */
-		u_int32_t spi;
-	} esp, ah;
-	/** details about IPComp */
-	struct {
-		/** the IPComp transform used */
-		u_int16_t transform;
-		/** CPI for IPComp */
-		u_int16_t cpi;
-	} ipcomp;
-};
-
-/**
- * A lifetime_cfg_t defines the lifetime limits of an SA.
- *
- * Set any of these values to 0 to ignore.
- */
-struct lifetime_cfg_t {
-	struct {
-		/** Limit before the SA gets invalid. */
-		u_int64_t	life;
-		/** Limit before the SA gets rekeyed. */
-		u_int64_t	rekey;
-		/** The range of a random value subtracted from rekey. */
-		u_int64_t	jitter;
-	} time, bytes, packets;
-};
-
-/**
- * A mark_t defines an optional mark in an IPsec SA.
- */
-struct mark_t {
-	/** Mark value */
-	u_int32_t value;
-	/** Mark mask */
-	u_int32_t mask;
-};
+#include <plugins/plugin.h>
+#include <kernel/kernel_interface.h>
 
 /**
  * Interface to the ipsec subsystem of the kernel.
@@ -163,6 +44,13 @@ struct mark_t {
  * when rekeying. Thats why we do reference counting of policies.
  */
 struct kernel_ipsec_t {
+
+	/**
+	 * Get the feature set supported by this kernel backend.
+	 *
+	 * @return				ORed feature-set of backend
+	 */
+	kernel_feature_t (*get_features)(kernel_ipsec_t *this);
 
 	/**
 	 * Get a SPI from the kernel.
@@ -213,6 +101,8 @@ struct kernel_ipsec_t {
 	 * @param mode			mode of the SA (tunnel, transport)
 	 * @param ipcomp		IPComp transform to use
 	 * @param cpi			CPI for IPComp
+	 * @param replay_window	anti-replay window size
+	 * @param initiator		TRUE if initiator of the exchange creating this SA
 	 * @param encap			enable UDP encapsulation for NAT traversal
 	 * @param esn			TRUE to use Extended Sequence Numbers
 	 * @param inbound		TRUE if this is an inbound SA
@@ -227,7 +117,8 @@ struct kernel_ipsec_t {
 						u_int16_t enc_alg, chunk_t enc_key,
 						u_int16_t int_alg, chunk_t int_key,
 						ipsec_mode_t mode, u_int16_t ipcomp, u_int16_t cpi,
-						bool encap, bool esn, bool inbound,
+						u_int32_t replay_window,
+						bool initiator, bool encap, bool esn, bool inbound,
 						traffic_selector_t *src_ts, traffic_selector_t *dst_ts);
 
 	/**
@@ -266,11 +157,13 @@ struct kernel_ipsec_t {
 	 * @param protocol		protocol for this SA (ESP/AH)
 	 * @param mark			optional mark for this SA
 	 * @param[out] bytes	the number of bytes processed by SA
+	 * @param[out] packets	number of packets processed by SA
+	 * @param[out] time		last (monotonic) time of SA use
 	 * @return				SUCCESS if operation completed
 	 */
 	status_t (*query_sa) (kernel_ipsec_t *this, host_t *src, host_t *dst,
 						  u_int32_t spi, u_int8_t protocol, mark_t mark,
-						  u_int64_t *bytes);
+						  u_int64_t *bytes, u_int64_t *packets, time_t *time);
 
 	/**
 	 * Delete a previusly installed SA from the SAD.
@@ -288,6 +181,13 @@ struct kernel_ipsec_t {
 						mark_t mark);
 
 	/**
+	 * Flush all SAs from the SAD.
+	 *
+	 * @return				SUCCESS if operation completed
+	 */
+	status_t (*flush_sas) (kernel_ipsec_t *this);
+
+	/**
 	 * Add a policy to the SPD.
 	 *
 	 * A policy is always associated to an SA. Traffic which matches a
@@ -301,7 +201,7 @@ struct kernel_ipsec_t {
 	 * @param type			type of policy, POLICY_(IPSEC|PASS|DROP)
 	 * @param sa			details about the SA(s) tied to this policy
 	 * @param mark			mark for this policy
-	 * @param routed		TRUE, if this policy is routed in the kernel
+	 * @param priority		priority of this policy
 	 * @return				SUCCESS if operation completed
 	 */
 	status_t (*add_policy) (kernel_ipsec_t *this,
@@ -309,7 +209,8 @@ struct kernel_ipsec_t {
 							traffic_selector_t *src_ts,
 							traffic_selector_t *dst_ts,
 							policy_dir_t direction, policy_type_t type,
-							ipsec_sa_cfg_t *sa, mark_t mark, bool routed);
+							ipsec_sa_cfg_t *sa, mark_t mark,
+							policy_priority_t priority);
 
 	/**
 	 * Query the use time of a policy.
@@ -329,7 +230,7 @@ struct kernel_ipsec_t {
 							  traffic_selector_t *src_ts,
 							  traffic_selector_t *dst_ts,
 							  policy_dir_t direction, mark_t mark,
-							  u_int32_t *use_time);
+							  time_t *use_time);
 
 	/**
 	 * Remove a policy from the SPD.
@@ -342,15 +243,23 @@ struct kernel_ipsec_t {
 	 * @param src_ts		traffic selector to match traffic source
 	 * @param dst_ts		traffic selector to match traffic dest
 	 * @param direction		direction of traffic, POLICY_(IN|OUT|FWD)
+	 * @param reqid			unique ID of the associated SA
 	 * @param mark			optional mark
-	 * @param unrouted		TRUE, if this policy is unrouted from the kernel
+	 * @param priority		priority of the policy
 	 * @return				SUCCESS if operation completed
 	 */
 	status_t (*del_policy) (kernel_ipsec_t *this,
 							traffic_selector_t *src_ts,
 							traffic_selector_t *dst_ts,
-							policy_dir_t direction, mark_t mark,
-							bool unrouted);
+							policy_dir_t direction, u_int32_t reqid,
+							mark_t mark, policy_priority_t priority);
+
+	/**
+	 * Flush all policies from the SPD.
+	 *
+	 * @return				SUCCESS if operation completed
+	 */
+	status_t (*flush_policies) (kernel_ipsec_t *this);
 
 	/**
 	 * Install a bypass policy for the given socket.
@@ -362,9 +271,34 @@ struct kernel_ipsec_t {
 	bool (*bypass_socket)(kernel_ipsec_t *this, int fd, int family);
 
 	/**
+	 * Enable decapsulation of ESP-in-UDP packets for the given port/socket.
+	 *
+	 * @param fd			socket file descriptor
+	 * @param family		protocol family of the socket
+	 * @param port			the UDP port
+	 * @return				TRUE if UDP decapsulation was enabled successfully
+	 */
+	bool (*enable_udp_decap)(kernel_ipsec_t *this, int fd, int family,
+							 u_int16_t port);
+
+	/**
 	 * Destroy the implementation.
 	 */
 	void (*destroy) (kernel_ipsec_t *this);
 };
+
+/**
+ * Helper function to (un-)register IPsec kernel interfaces from plugin features.
+ *
+ * This function is a plugin_feature_callback_t and can be used with the
+ * PLUGIN_CALLBACK macro to register an IPsec kernel interface constructor.
+ *
+ * @param plugin		plugin registering the kernel interface
+ * @param feature		associated plugin feature
+ * @param reg			TRUE to register, FALSE to unregister
+ * @param data			data passed to callback, an kernel_ipsec_constructor_t
+ */
+bool kernel_ipsec_register(plugin_t *plugin, plugin_feature_t *feature,
+						   bool reg, void *data);
 
 #endif /** KERNEL_IPSEC_H_ @}*/

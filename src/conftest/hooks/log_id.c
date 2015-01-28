@@ -32,9 +32,9 @@ struct private_log_id_t {
 
 METHOD(listener_t, message, bool,
 	private_log_id_t *this, ike_sa_t *ike_sa, message_t *message,
-	bool incoming)
+	bool incoming, bool plain)
 {
-	if (incoming)
+	if (incoming && plain)
 	{
 		enumerator_t *enumerator;
 		payload_t *payload;
@@ -45,8 +45,8 @@ METHOD(listener_t, message, bool,
 		enumerator = message->create_payload_enumerator(message);
 		while (enumerator->enumerate(enumerator, &payload))
 		{
-			if (payload->get_type(payload) == ID_INITIATOR ||
-				payload->get_type(payload) == ID_RESPONDER)
+			if (payload->get_type(payload) == PLV2_ID_INITIATOR ||
+				payload->get_type(payload) == PLV2_ID_RESPONDER)
 			{
 				id_payload = (id_payload_t*)payload;
 				id = id_payload->get_identification(id_payload);

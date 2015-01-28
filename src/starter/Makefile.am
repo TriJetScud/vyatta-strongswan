@@ -1,64 +1,63 @@
+SUBDIRS = . tests
+
 ipsec_PROGRAMS = starter
-starter_SOURCES = y.tab.c netkey.c y.tab.h parser.h args.h netkey.h \
-starterwhack.c starterwhack.h starterstroke.c invokepluto.c confread.c \
-starterstroke.h interfaces.c invokepluto.h confread.h interfaces.h args.c \
-keywords.c files.h keywords.h cmp.c starter.c cmp.h exec.c invokecharon.c \
-exec.h invokecharon.h lex.yy.c loglite.c klips.c klips.h
+starter_SOURCES = \
+starter.c files.h \
+args.c args.h confread.c confread.h keywords.c keywords.h cmp.c cmp.h \
+invokecharon.c invokecharon.h starterstroke.c starterstroke.h \
+netkey.c netkey.h klips.c klips.h
 
-INCLUDES = \
--I${linux_headers} \
--I$(top_srcdir)/src/libstrongswan \
--I$(top_srcdir)/src/libfreeswan \
--I$(top_srcdir)/src/libhydra \
--I$(top_srcdir)/src/pluto \
--I$(top_srcdir)/src/whack \
--I$(top_srcdir)/src/stroke
+# parser is also used by tests
+noinst_LTLIBRARIES = libstarter.la
+libstarter_la_SOURCES = \
+parser/parser.y parser/lexer.l parser/conf_parser.c parser/conf_parser.h
 
-AM_CFLAGS = \
--DIPSEC_DIR=\"${ipsecdir}\" \
--DIPSEC_CONFDIR=\"${sysconfdir}\" \
--DIPSEC_PIDDIR=\"${piddir}\" \
--DIPSEC_EAPDIR=\"${eapdir}\" \
--DDEV_RANDOM=\"${random_device}\" \
--DDEV_URANDOM=\"${urandom_device}\" \
--DDEBUG
+AM_CPPFLAGS = \
+	-I${linux_headers} \
+	-I$(top_srcdir)/src/libstrongswan \
+	-I$(top_srcdir)/src/libhydra \
+	-I$(top_srcdir)/src/starter \
+	-I$(top_srcdir)/src/stroke \
+	-DIPSEC_DIR=\"${ipsecdir}\" \
+	-DIPSEC_CONFDIR=\"${sysconfdir}\" \
+	-DIPSEC_PIDDIR=\"${piddir}\" \
+	-DIPSEC_EAPDIR=\"${eapdir}\" \
+	-DIPSEC_SCRIPT=\"${ipsec_script}\" \
+	-DDEV_RANDOM=\"${random_device}\" \
+	-DDEV_URANDOM=\"${urandom_device}\" \
+	-DPLUGINS=\""${starter_plugins}\"" \
+	-DDEBUG
 
-starter_LDADD = defs.o $(top_builddir)/src/libfreeswan/libfreeswan.a $(top_builddir)/src/libstrongswan/libstrongswan.la $(SOCKLIB)
-EXTRA_DIST = parser.l parser.y keywords.txt ipsec.conf
-MAINTAINERCLEANFILES = lex.yy.c y.tab.c y.tab.h keywords.c
+AM_YFLAGS = -v -d
 
-PLUTODIR=$(top_srcdir)/src/pluto
-SCEPCLIENTDIR=$(top_srcdir)/src/scepclient
+starter_LDADD = \
+	$(top_builddir)/src/libstrongswan/libstrongswan.la \
+	$(top_builddir)/src/libhydra/libhydra.la \
+	libstarter.la \
+	$(SOCKLIB) $(PTHREADLIB)
 
-if USE_PLUTO
-  AM_CFLAGS += -DSTART_PLUTO
-endif
+EXTRA_DIST = keywords.txt ipsec.conf Android.mk
+MAINTAINERCLEANFILES = keywords.c
+BUILT_SOURCES = keywords.c parser/parser.h
 
 if USE_CHARON
-  AM_CFLAGS += -DSTART_CHARON
+  AM_CPPFLAGS += -DSTART_CHARON
 endif
 
 if USE_LOAD_WARNING
-  AM_CFLAGS += -DLOAD_WARNING
+  AM_CPPFLAGS += -DLOAD_WARNING
 endif
 
-lex.yy.c:	$(srcdir)/parser.l $(srcdir)/parser.y $(srcdir)/parser.h y.tab.h
-		$(LEX) $(srcdir)/parser.l
-
-y.tab.c:	$(srcdir)/parser.y $(srcdir)/parser.l $(srcdir)/parser.h
-		$(YACC) -v -d $(srcdir)/parser.y
-
-y.tab.h:	$(srcdir)/parser.y $(srcdir)/parser.l $(srcdir)/parser.h
-		$(YACC) -v -d $(srcdir)/parser.y
+if USE_SCEPCLIENT
+  AM_CPPFLAGS += -DGENERATE_SELFCERT
+endif
 
 keywords.c:	$(srcdir)/keywords.txt $(srcdir)/keywords.h
+		$(AM_V_GEN) \
 		$(GPERF) -m 10 -C -G -D -t < $(srcdir)/keywords.txt > $@
 
-defs.o:		$(PLUTODIR)/defs.c $(PLUTODIR)/defs.h
-		$(COMPILE) -c -o $@ $(PLUTODIR)/defs.c
-
 install-exec-local :
-		test -e "$(DESTDIR)${sysconfdir}/ipsec.d" || $(INSTALL) -o -d "$(DESTDIR)$(sysconfdir)/ipsec.d" || true
+		test -e "$(DESTDIR)${sysconfdir}/ipsec.d" || $(INSTALL) -d "$(DESTDIR)$(sysconfdir)/ipsec.d" || true
 		test -e "$(DESTDIR)${sysconfdir}/ipsec.d/cacerts" || $(INSTALL) -d "$(DESTDIR)$(sysconfdir)/ipsec.d/cacerts" || true
 		test -e "$(DESTDIR)${sysconfdir}/ipsec.d/ocspcerts" || $(INSTALL) -d "$(DESTDIR)$(sysconfdir)/ipsec.d/ocspcerts" || true
 		test -e "$(DESTDIR)${sysconfdir}/ipsec.d/certs" || $(INSTALL) -d "$(DESTDIR)$(sysconfdir)/ipsec.d/certs" || true
@@ -68,4 +67,3 @@ install-exec-local :
 		test -e "$(DESTDIR)${sysconfdir}/ipsec.d/reqs" || $(INSTALL) -d "$(DESTDIR)$(sysconfdir)/ipsec.d/reqs" || true
 		test -e "$(DESTDIR)${sysconfdir}/ipsec.d/private" || $(INSTALL) -d -m 750 "$(DESTDIR)$(sysconfdir)/ipsec.d/private" || true
 		test -e "$(DESTDIR)$(sysconfdir)/ipsec.conf" || $(INSTALL) -m 644 $(srcdir)/ipsec.conf $(DESTDIR)$(sysconfdir)/ipsec.conf || true
-

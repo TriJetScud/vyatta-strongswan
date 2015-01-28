@@ -42,11 +42,6 @@ struct private_uci_control_t {
 	 * Public part
 	 */
 	uci_control_t public;
-
-	/**
-	 * Job
-	 */
-	callback_job_t *job;
 };
 
 /**
@@ -76,8 +71,8 @@ static void write_fifo(private_uci_control_t *this, char *format, ...)
  */
 static void status(private_uci_control_t *this, char *name)
 {
-	enumerator_t *configs, *sas;
-	iterator_t *children;
+	enumerator_t *configs, *sas, *children;
+	linked_list_t *list;
 	ike_sa_t *ike_sa;
 	child_sa_t *child_sa;
 	peer_cfg_t *peer_cfg;
@@ -85,14 +80,15 @@ static void status(private_uci_control_t *this, char *name)
 	FILE *out = NULL;
 
 	configs = charon->backends->create_peer_cfg_enumerator(charon->backends,
-														NULL, NULL, NULL, NULL);
+											NULL, NULL, NULL, NULL, IKE_ANY);
 	while (configs->enumerate(configs, &peer_cfg))
 	{
 		if (name && !streq(name, peer_cfg->get_name(peer_cfg)))
 		{
 			continue;
 		}
-		sas = charon->controller->create_ike_sa_enumerator(charon->controller);
+		sas = charon->controller->create_ike_sa_enumerator(
+													charon->controller, TRUE);
 		while (sas->enumerate(sas, &ike_sa))
 		{
 			if (!streq(ike_sa->get_name(ike_sa), peer_cfg->get_name(peer_cfg)))
@@ -110,11 +106,13 @@ static void status(private_uci_control_t *this, char *name)
 			fprintf(out, "%-8s %-20D %-16H ", ike_sa->get_name(ike_sa),
 				ike_sa->get_other_id(ike_sa), ike_sa->get_other_host(ike_sa));
 
-			children = ike_sa->create_child_sa_iterator(ike_sa);
-			while (children->iterate(children, (void**)&child_sa))
+			children = ike_sa->create_child_sa_enumerator(ike_sa);
+			while (children->enumerate(children, (void**)&child_sa))
 			{
-				fprintf(out, "%#R",
-						child_sa->get_traffic_selectors(child_sa, FALSE));
+				list = linked_list_create_from_enumerator(
+							child_sa->create_ts_enumerator(child_sa, FALSE));
+				fprintf(out, "%#R", list);
+				list->destroy(list);
 			}
 			children->destroy(children);
 			fprintf(out, "\n");
@@ -148,8 +146,8 @@ static void initiate(private_uci_control_t *this, char *name)
 		enumerator = peer_cfg->create_child_cfg_enumerator(peer_cfg);
 		if (enumerator->enumerate(enumerator, &child_cfg) &&
 			charon->controller->initiate(charon->controller, peer_cfg,
-										 child_cfg->get_ref(child_cfg),
-										 controller_cb_empty, NULL) == SUCCESS)
+								child_cfg->get_ref(child_cfg),
+								controller_cb_empty, NULL, 0) == SUCCESS)
 		{
 			write_fifo(this, "connection '%s' established\n", name);
 		}
@@ -174,7 +172,8 @@ static void terminate(private_uci_control_t *this, char *name)
 	ike_sa_t *ike_sa;
 	u_int id;
 
-	enumerator = charon->controller->create_ike_sa_enumerator(charon->controller);
+	enumerator = charon->controller->create_ike_sa_enumerator(
+													charon->controller, TRUE);
 	while (enumerator->enumerate(enumerator, &ike_sa))
 	{
 		if (streq(name, ike_sa->get_name(ike_sa)))
@@ -182,7 +181,7 @@ static void terminate(private_uci_control_t *this, char *name)
 			id = ike_sa->get_unique_id(ike_sa);
 			enumerator->destroy(enumerator);
 			charon->controller->terminate_ike(charon->controller, id,
-											  controller_cb_empty, NULL);
+											  controller_cb_empty, NULL, 0);
 			write_fifo(this, "connection '%s' terminated\n", name);
 			return;
 		}
@@ -265,12 +264,9 @@ static job_requeue_t receive(private_uci_control_t *this)
 	return JOB_REQUEUE_FAIR;
 }
 
-/**
- * Implementation of uci_control_t.destroy
- */
-static void destroy(private_uci_control_t *this)
+METHOD(uci_control_t, destroy, void,
+	private_uci_control_t *this)
 {
-	this->job->cancel(this->job);
 	unlink(FIFO_FILE);
 	free(this);
 }
@@ -280,9 +276,13 @@ static void destroy(private_uci_control_t *this)
  */
 uci_control_t *uci_control_create()
 {
-	private_uci_control_t *this = malloc_thing(private_uci_control_t);
+	private_uci_control_t *this;
 
-	this->public.destroy = (void(*)(uci_control_t*))destroy;
+	INIT(this,
+		.public = {
+			.destroy = _destroy,
+		},
+	);
 
 	unlink(FIFO_FILE);
 	if (mkfifo(FIFO_FILE, S_IRUSR|S_IWUSR) != 0)
@@ -292,10 +292,10 @@ uci_control_t *uci_control_create()
 	}
 	else
 	{
-		this->job = callback_job_create((callback_job_cb_t)receive,
-										this, NULL, NULL);
-		lib->processor->queue_job(lib->processor, (job_t*)this->job);
+		lib->processor->queue_job(lib->processor,
+			(job_t*)callback_job_create_with_prio((callback_job_cb_t)receive,
+							this, NULL, (callback_job_cancel_t)return_false,
+							JOB_PRIO_CRITICAL));
 	}
 	return &this->public;
 }
-

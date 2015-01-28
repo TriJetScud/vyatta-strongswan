@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 #include <library.h>
-#include <debug.h>
+#include <utils/debug.h>
 
 static int count = 0;
 
@@ -35,9 +35,9 @@ int main(int argc, char *argv[])
 {
 	chunk_t res;
 
-	library_init(NULL);
+	library_init(NULL, "fetch");
 	atexit(library_deinit);
-	lib->plugins->load(lib->plugins, NULL, PLUGINS);
+	lib->plugins->load(lib->plugins, PLUGINS);
 
 	if (argc != 3 || (!streq(argv[1], "a") && !streq(argv[1], "s")))
 	{

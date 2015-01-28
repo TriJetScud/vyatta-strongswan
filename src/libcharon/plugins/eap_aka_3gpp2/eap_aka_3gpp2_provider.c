@@ -80,26 +80,22 @@ void eap_aka_3gpp2_get_sqn(char sqn[AKA_SQN_LEN], int offset)
 	memcpy(sqn + 4, &time.tv_usec, 2);
 }
 
-/**
- * Implementation of usim_provider_t.get_quintuplet
- */
-static bool get_quintuplet(private_eap_aka_3gpp2_provider_t *this,
-						   identification_t *id, char rand[AKA_RAND_LEN],
-						   char xres[AKA_RES_MAX], int *xres_len,
-						   char ck[AKA_CK_LEN], char ik[AKA_IK_LEN],
-						   char autn[AKA_AUTN_LEN])
+METHOD(simaka_provider_t, get_quintuplet, bool,
+	private_eap_aka_3gpp2_provider_t *this, identification_t *id,
+	char rand[AKA_RAND_LEN], char xres[AKA_RES_MAX], int *xres_len,
+	char ck[AKA_CK_LEN], char ik[AKA_IK_LEN], char autn[AKA_AUTN_LEN])
 {
 	rng_t *rng;
 	char mac[AKA_MAC_LEN], ak[AKA_AK_LEN], k[AKA_K_LEN];
 
 	/* generate RAND: we use a registered RNG, not f0() proposed in S.S0055 */
 	rng = lib->crypto->create_rng(lib->crypto, RNG_WEAK);
-	if (!rng)
+	if (!rng || !rng->get_bytes(rng, AKA_RAND_LEN, rand))
 	{
 		DBG1(DBG_IKE, "generating RAND for AKA failed");
+		DESTROY_IF(rng);
 		return FALSE;
 	}
-	rng->get_bytes(rng, AKA_RAND_LEN, rand);
 	rng->destroy(rng);
 
 	if (!eap_aka_3gpp2_get_k(id, k))
@@ -111,12 +107,13 @@ static bool get_quintuplet(private_eap_aka_3gpp2_provider_t *this,
 	DBG3(DBG_IKE, "generated rand %b", rand, AKA_RAND_LEN);
 	DBG3(DBG_IKE, "using K %b", k, AKA_K_LEN);
 
-	/* MAC */
-	this->f->f1(this->f, k, rand, this->sqn, amf, mac);
-	/* AK */
-	this->f->f5(this->f, k, rand, ak);
-	/* XRES as expected from client */
-	this->f->f2(this->f, k, rand, xres);
+	/* MAC, AK, XRES as expected from client */
+	if (!this->f->f1(this->f, k, rand, this->sqn, amf, mac) ||
+		!this->f->f5(this->f, k, rand, ak) ||
+		!this->f->f2(this->f, k, rand, xres))
+	{
+		return FALSE;
+	}
 	*xres_len = AKA_RES_MAX;
 	/* AUTN = (SQN xor AK) || AMF || MAC */
 	memcpy(autn, this->sqn, AKA_SQN_LEN);
@@ -125,18 +122,17 @@ static bool get_quintuplet(private_eap_aka_3gpp2_provider_t *this,
 	memcpy(autn + AKA_SQN_LEN + AKA_AMF_LEN, mac, AKA_MAC_LEN);
 	DBG3(DBG_IKE, "AUTN %b", autn, AKA_AUTN_LEN);
 	/* CK/IK */
-	this->f->f3(this->f, k, rand, ck);
-	this->f->f4(this->f, k, rand, ik);
-
+	if (!this->f->f3(this->f, k, rand, ck) ||
+		!this->f->f4(this->f, k, rand, ik))
+	{
+		return FALSE;
+	}
 	return TRUE;
 }
 
-/**
- * Implementation of usim_provider_t.resync
- */
-static bool resync(private_eap_aka_3gpp2_provider_t *this,
-				   identification_t *id, char rand[AKA_RAND_LEN],
-				   char auts[AKA_AUTS_LEN])
+METHOD(simaka_provider_t, resync, bool,
+	private_eap_aka_3gpp2_provider_t *this, identification_t *id,
+	char rand[AKA_RAND_LEN], char auts[AKA_AUTS_LEN])
 {
 	char *sqn, *macs;
 	char aks[AKA_AK_LEN], k[AKA_K_LEN], amf[AKA_AMF_LEN], xmacs[AKA_MAC_LEN];
@@ -150,12 +146,18 @@ static bool resync(private_eap_aka_3gpp2_provider_t *this,
 	/* AUTHS = (AK xor SQN) | MAC */
 	sqn = auts;
 	macs = auts + AKA_SQN_LEN;
-	this->f->f5star(this->f, k, rand, aks);
+	if (!this->f->f5star(this->f, k, rand, aks))
+	{
+		return FALSE;
+	}
 	memxor(sqn, aks, AKA_AK_LEN);
 
 	/* verify XMACS, AMF of zero is used in resynchronization */
 	memset(amf, 0, AKA_AMF_LEN);
-	this->f->f1star(this->f, k, rand, sqn, amf, xmacs);
+	if (!this->f->f1star(this->f, k, rand, sqn, amf, xmacs))
+	{
+		return FALSE;
+	}
 	if (!memeq(macs, xmacs, AKA_MAC_LEN))
 	{
 		DBG1(DBG_IKE, "received MACS does not match XMACS");
@@ -169,10 +171,8 @@ static bool resync(private_eap_aka_3gpp2_provider_t *this,
 	return TRUE;
 }
 
-/**
- * Implementation of eap_aka_3gpp2_provider_t.destroy.
- */
-static void destroy(private_eap_aka_3gpp2_provider_t *this)
+METHOD(eap_aka_3gpp2_provider_t, destroy, void,
+	private_eap_aka_3gpp2_provider_t *this)
 {
 	free(this);
 }
@@ -183,18 +183,23 @@ static void destroy(private_eap_aka_3gpp2_provider_t *this)
 eap_aka_3gpp2_provider_t *eap_aka_3gpp2_provider_create(
 												eap_aka_3gpp2_functions_t *f)
 {
-	private_eap_aka_3gpp2_provider_t *this = malloc_thing(private_eap_aka_3gpp2_provider_t);
+	private_eap_aka_3gpp2_provider_t *this;
 
-	this->public.provider.get_triplet = (bool(*)(sim_provider_t*, identification_t *id, char rand[SIM_RAND_LEN], char sres[SIM_SRES_LEN], char kc[SIM_KC_LEN]))return_false;
-	this->public.provider.get_quintuplet = (bool(*)(sim_provider_t*, identification_t *id, char rand[AKA_RAND_LEN], char xres[AKA_RES_MAX], int *xres_len, char ck[AKA_CK_LEN], char ik[AKA_IK_LEN], char autn[AKA_AUTN_LEN]))get_quintuplet;
-	this->public.provider.resync = (bool(*)(sim_provider_t*, identification_t *id, char rand[AKA_RAND_LEN], char auts[AKA_AUTS_LEN]))resync;
-	this->public.provider.is_pseudonym = (identification_t*(*)(sim_provider_t*, identification_t *id))return_null;
-	this->public.provider.gen_pseudonym = (identification_t*(*)(sim_provider_t*, identification_t *id))return_null;
-	this->public.provider.is_reauth = (identification_t*(*)(sim_provider_t*, identification_t *id, char [HASH_SIZE_SHA1], u_int16_t *counter))return_null;
-	this->public.provider.gen_reauth = (identification_t*(*)(sim_provider_t*, identification_t *id, char mk[HASH_SIZE_SHA1]))return_null;
-	this->public.destroy = (void(*)(eap_aka_3gpp2_provider_t*))destroy;
-
-	this->f = f;
+	INIT(this,
+		.public = {
+			.provider = {
+				.get_triplet = (void*)return_false,
+				.get_quintuplet = _get_quintuplet,
+				.resync = _resync,
+				.is_pseudonym = (void*)return_null,
+				.gen_pseudonym = (void*)return_null,
+				.is_reauth = (void*)return_null,
+				.gen_reauth = (void*)return_null,
+			},
+			.destroy = _destroy,
+		},
+		.f = f,
+	);
 	/* use an offset to accept clock skew between client/server without resync */
 	eap_aka_3gpp2_get_sqn(this->sqn, 180);
 

@@ -70,7 +70,11 @@ static bool get_cert_hash(private_coupling_validator_t *this,
 	{
 		return FALSE;
 	}
-	this->hasher->get_hash(this->hasher, encoding, buf);
+	if (!this->hasher->get_hash(this->hasher, encoding, buf))
+	{
+		free(encoding.ptr);
+		return FALSE;
+	}
 	free(encoding.ptr);
 	chunk_to_hex(chunk_create(buf, this->hasher->get_hash_size(this->hasher)),
 				 hex, FALSE);
@@ -163,6 +167,8 @@ METHOD(cert_validator_t, validate, bool,
 			{
 				DBG1(DBG_CFG, "coupling new certificate '%Y' failed",
 					 subject->get_subject(subject));
+				lib->credmgr->call_hook(lib->credmgr,
+										CRED_HOOK_POLICY_VIOLATION, subject);
 			}
 		}
 		else
@@ -170,6 +176,8 @@ METHOD(cert_validator_t, validate, bool,
 			DBG1(DBG_CFG, "coupling new certificate '%Y' failed, limit of %d "
 				 "couplings reached", subject->get_subject(subject),
 				 this->max_couplings);
+			lib->credmgr->call_hook(lib->credmgr, CRED_HOOK_POLICY_VIOLATION,
+									subject);
 		}
 		this->mutex->unlock(this->mutex);
 	}
@@ -194,18 +202,8 @@ METHOD(coupling_validator_t, destroy, void,
 coupling_validator_t *coupling_validator_create()
 {
 	private_coupling_validator_t *this;
+	hash_algorithm_t alg;
 	char *path, *hash;
-	int i;
-	struct {
-		hash_algorithm_t alg;
-		char *name;
-	} hash_types[] = {
-		{ HASH_MD5,		"md5"},
-		{ HASH_SHA1,	"sha1"},
-		{ HASH_SHA256,	"sha256"},
-		{ HASH_SHA384,	"sha384"},
-		{ HASH_SHA512,	"sha512"},
-	};
 
 	INIT(this,
 		.public = {
@@ -216,20 +214,19 @@ coupling_validator_t *coupling_validator_create()
 		},
 		.mutex = mutex_create(MUTEX_TYPE_DEFAULT),
 		.max_couplings = lib->settings->get_int(lib->settings,
-									  "charon.plugins.coupling.max", 1),
+												"%s.plugins.coupling.max", 1,
+												lib->ns),
 	);
 
 	hash = lib->settings->get_str(lib->settings,
-								  "charon.plugins.coupling.hash", "sha1");
-	for (i = 0; i < countof(hash_types); i++)
+								  "%s.plugins.coupling.hash", "sha1", lib->ns);
+	if (!enum_from_name(hash_algorithm_short_names, hash, &alg))
 	{
-		if (strcaseeq(hash_types[i].name, hash))
-		{
-			this->hasher = lib->crypto->create_hasher(lib->crypto,
-													  hash_types[i].alg);
-			break;
-		}
+		DBG1(DBG_CFG, "unknown coupling hash algorithm: %s", hash);
+		destroy(this);
+		return NULL;
 	}
+	this->hasher = lib->crypto->create_hasher(lib->crypto, alg);
 	if (!this->hasher)
 	{
 		DBG1(DBG_CFG, "unsupported coupling hash algorithm: %s", hash);
@@ -238,7 +235,7 @@ coupling_validator_t *coupling_validator_create()
 	}
 
 	path = lib->settings->get_str(lib->settings,
-								  "charon.plugins.coupling.file", NULL);
+								  "%s.plugins.coupling.file", NULL, lib->ns);
 	if (!path)
 	{
 		DBG1(DBG_CFG, "coupling file path unspecified");

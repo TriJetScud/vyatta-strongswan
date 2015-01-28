@@ -16,7 +16,7 @@
 
 #include "openssl_util.h"
 
-#include <debug.h>
+#include <utils/debug.h>
 
 #include <openssl/evp.h>
 #include <openssl/x509.h>
@@ -126,11 +126,29 @@ bool openssl_bn_split(chunk_t chunk, BIGNUM *a, BIGNUM *b)
 /**
  * Described in header.
  */
+bool openssl_bn2chunk(BIGNUM *bn, chunk_t *chunk)
+{
+	*chunk = chunk_alloc(BN_num_bytes(bn));
+	if (BN_bn2bin(bn, chunk->ptr) == chunk->len)
+	{
+		if (chunk->len && chunk->ptr[0] & 0x80)
+		{	/* if MSB is set, prepend a zero to make it non-negative */
+			*chunk = chunk_cat("cm", chunk_from_chars(0x00), *chunk);
+		}
+		return TRUE;
+	}
+	chunk_free(chunk);
+	return FALSE;
+}
+
+/**
+ * Described in header.
+ */
 chunk_t openssl_asn1_obj2chunk(ASN1_OBJECT *asn1)
 {
 	if (asn1)
 	{
-		return chunk_create(asn1->data, asn1->length);
+		return chunk_create((u_char*)asn1->data, asn1->length);
 	}
 	return chunk_empty;
 }

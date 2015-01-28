@@ -44,6 +44,11 @@ struct private_delete_child_sa_job_t {
 	 * inbound SPI of the CHILD_SA
 	 */
 	u_int32_t spi;
+
+	/**
+	 * Delete for an expired CHILD_SA
+	 */
+	bool expired;
 };
 
 METHOD(job_t, destroy, void,
@@ -52,7 +57,7 @@ METHOD(job_t, destroy, void,
 	free(this);
 }
 
-METHOD(job_t, execute, void,
+METHOD(job_t, execute, job_requeue_t,
 	private_delete_child_sa_job_t *this)
 {
 	ike_sa_t *ike_sa;
@@ -66,19 +71,24 @@ METHOD(job_t, execute, void,
 	}
 	else
 	{
-		ike_sa->delete_child_sa(ike_sa, this->protocol, this->spi);
+		ike_sa->delete_child_sa(ike_sa, this->protocol, this->spi, this->expired);
 
 		charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa);
 	}
-	destroy(this);
+	return JOB_REQUEUE_NONE;
+}
+
+METHOD(job_t, get_priority, job_priority_t,
+	private_delete_child_sa_job_t *this)
+{
+	return JOB_PRIO_MEDIUM;
 }
 
 /*
  * Described in header
  */
 delete_child_sa_job_t *delete_child_sa_job_create(u_int32_t reqid,
-												  protocol_id_t protocol,
-												  u_int32_t spi)
+							protocol_id_t protocol, u_int32_t spi, bool expired)
 {
 	private_delete_child_sa_job_t *this;
 
@@ -86,12 +96,14 @@ delete_child_sa_job_t *delete_child_sa_job_create(u_int32_t reqid,
 		.public = {
 			.job_interface = {
 				.execute = _execute,
+				.get_priority = _get_priority,
 				.destroy = _destroy,
 			},
 		},
 		.reqid = reqid,
 		.protocol = protocol,
 		.spi = spi,
+		.expired = expired,
 	);
 
 	return &this->public;

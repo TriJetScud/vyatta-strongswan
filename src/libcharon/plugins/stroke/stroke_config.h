@@ -1,4 +1,5 @@
 /*
+ * Copyright (C) 2012 Tobias Brunner
  * Copyright (C) 2008 Martin Willi
  * Hochschule fuer Technik Rapperswil
  *
@@ -25,6 +26,7 @@
 #include <stroke_msg.h>
 #include "stroke_ca.h"
 #include "stroke_cred.h"
+#include "stroke_attribute.h"
 
 typedef struct stroke_config_t stroke_config_t;
 
@@ -53,6 +55,15 @@ struct stroke_config_t {
 	void (*del)(stroke_config_t *this, stroke_msg_t *msg);
 
 	/**
+	 * Set the username and password for a connection in this backend.
+	 *
+	 * @param msg		received stroke message
+	 * @param prompt	I/O channel to prompt for the password
+	 */
+	void (*set_user_credentials)(stroke_config_t *this, stroke_msg_t *msg,
+								 FILE *prompt);
+
+	/**
 	 * Destroy a stroke_config instance.
 	 */
 	void (*destroy)(stroke_config_t *this);
@@ -61,6 +72,7 @@ struct stroke_config_t {
 /**
  * Create a stroke_config instance.
  */
-stroke_config_t *stroke_config_create(stroke_ca_t *ca, stroke_cred_t *cred);
+stroke_config_t *stroke_config_create(stroke_ca_t *ca, stroke_cred_t *cred,
+									  stroke_attribute_t *attributes);
 
 #endif /** STROKE_CONFIG_H_ @}*/

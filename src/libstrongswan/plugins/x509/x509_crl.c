@@ -20,14 +20,14 @@ typedef struct revoked_t revoked_t;
 
 #include <time.h>
 
-#include <debug.h>
+#include <utils/debug.h>
 #include <library.h>
 #include <asn1/oid.h>
 #include <asn1/asn1.h>
 #include <asn1/asn1_parser.h>
 #include <credentials/certificates/x509.h>
 #include <credentials/keys/private_key.h>
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 
 /**
  * entry for a revoked certificate
@@ -221,7 +221,7 @@ static bool parse(private_x509_crl_t *this)
 {
 	asn1_parser_t *parser;
 	chunk_t object;
-	chunk_t extnID;
+	chunk_t extnID = chunk_empty;
 	chunk_t userCertificate = chunk_empty;
 	int objectID;
 	int sig_alg = OID_UNKNOWN;
@@ -242,14 +242,14 @@ static bool parse(private_x509_crl_t *this)
 				break;
 			case CRL_OBJ_VERSION:
 				this->version = (object.len) ? (1+(u_int)*object.ptr) : 1;
-				DBG2(DBG_LIB, "  v%d", this->version);
+				DBG2(DBG_ASN, "  v%d", this->version);
 				break;
 			case CRL_OBJ_SIG_ALG:
 				sig_alg = asn1_parse_algorithmIdentifier(object, level, NULL);
 				break;
 			case CRL_OBJ_ISSUER:
 				this->issuer = identification_create_from_encoding(ID_DER_ASN1_DN, object);
-				DBG2(DBG_LIB, "  '%Y'", this->issuer);
+				DBG2(DBG_ASN, "  '%Y'", this->issuer);
 				break;
 			case CRL_OBJ_THIS_UPDATE:
 				this->thisUpdate = asn1_parse_time(object, level);
@@ -274,7 +274,7 @@ static bool parse(private_x509_crl_t *this)
 			case CRL_OBJ_CRL_ENTRY_CRITICAL:
 			case CRL_OBJ_CRITICAL:
 				critical = object.len && *object.ptr;
-				DBG2(DBG_LIB, "  %s", critical ? "TRUE" : "FALSE");
+				DBG2(DBG_ASN, "  %s", critical ? "TRUE" : "FALSE");
 				break;
 			case CRL_OBJ_CRL_ENTRY_EXTN_VALUE:
 			case CRL_OBJ_EXTN_VALUE:
@@ -291,7 +291,7 @@ static bool parse(private_x509_crl_t *this)
 							{
 								revoked->reason = *object.ptr;
 							}
-							DBG2(DBG_LIB, "  '%N'", crl_reason_names,
+							DBG2(DBG_ASN, "  '%N'", crl_reason_names,
 								 revoked->reason);
 						}
 						break;
@@ -320,11 +320,14 @@ static bool parse(private_x509_crl_t *this)
 						}
 						this->baseCrlNumber = object;
 						break;
+					case OID_ISSUING_DIST_POINT:
+						/* TODO support of IssuingDistributionPoints */
+						break;
 					default:
 						if (critical && lib->settings->get_bool(lib->settings,
-							"libstrongswan.x509.enforce_critical", TRUE))
+							"%s.x509.enforce_critical", TRUE, lib->ns))
 						{
-							DBG1(DBG_LIB, "critical '%s' extension not supported",
+							DBG1(DBG_ASN, "critical '%s' extension not supported",
 								 (extn_oid == OID_UNKNOWN) ? "unknown" :
 								 (char*)oid_names[extn_oid].name);
 							goto end;
@@ -338,13 +341,13 @@ static bool parse(private_x509_crl_t *this)
 				this->algorithm = asn1_parse_algorithmIdentifier(object, level, NULL);
 				if (this->algorithm != sig_alg)
 				{
-					DBG1(DBG_LIB, "  signature algorithms do not agree");
+					DBG1(DBG_ASN, "  signature algorithms do not agree");
 					goto end;
 				}
 				break;
 			}
 			case CRL_OBJ_SIGNATURE:
-				this->signature = object;
+				this->signature = chunk_skip(object, 1);
 				break;
 			default:
 				break;
@@ -442,7 +445,7 @@ METHOD(certificate_t, has_issuer, id_match_t,
 }
 
 METHOD(certificate_t, issued_by, bool,
-	private_x509_crl_t *this, certificate_t *issuer)
+	private_x509_crl_t *this, certificate_t *issuer, signature_scheme_t *schemep)
 {
 	public_key_t *key;
 	signature_scheme_t scheme;
@@ -490,6 +493,10 @@ METHOD(certificate_t, issued_by, bool,
 	}
 	valid = key->verify(key, scheme, this->tbsCertList, this->signature);
 	key->destroy(key);
+	if (valid && schemep)
+	{
+		*schemep = scheme;
+	}
 	return valid;
 }
 

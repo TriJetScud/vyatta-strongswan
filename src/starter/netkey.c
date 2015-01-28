@@ -16,16 +16,13 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 
-#include <freeswan.h>
-
-#include "../pluto/constants.h"
-#include "../pluto/defs.h"
-#include "../pluto/log.h"
+#include <library.h>
+#include <hydra.h>
+#include <utils/debug.h>
 
 #include "files.h"
 
-bool
-starter_netkey_init(void)
+bool starter_netkey_init(void)
 {
 	struct stat stb;
 
@@ -40,9 +37,7 @@ starter_netkey_init(void)
 		/* now test again */
 		if (stat(PROC_NETKEY, &stb) != 0)
 		{
-			DBG(DBG_CONTROL,
-				DBG_log("kernel appears to lack the native netkey IPsec stack")
-			)
+			DBG2(DBG_APP, "kernel appears to lack the native netkey IPsec stack");
 			return FALSE;
 		}
 	}
@@ -57,27 +52,19 @@ starter_netkey_init(void)
 		ignore_result(system("modprobe -qv xfrm_user"));
 	}
 
-	DBG(DBG_CONTROL,
-		DBG_log("Found netkey IPsec stack")
-	)
+	DBG2(DBG_APP, "found netkey IPsec stack");
 	return TRUE;
 }
 
-void
-starter_netkey_cleanup(void)
+void starter_netkey_cleanup(void)
 {
-	if (system("ip xfrm state > /dev/null 2>&1") == 0)
+	if (!lib->plugins->load(lib->plugins,
+			lib->settings->get_str(lib->settings, "starter.load", PLUGINS)))
 	{
-		ignore_result(system("ip xfrm state flush"));
-		ignore_result(system("ip xfrm policy flush"));
+		DBG1(DBG_APP, "unable to load kernel plugins");
+		return;
 	}
-	else if (system("type setkey > /dev/null 2>&1") == 0)
-	{
-		ignore_result(system("setkey -F"));
-		ignore_result(system("setkey -FP"));
-	}
-	else
-	{
-		plog("WARNING: cannot flush IPsec state/policy database");
-	}
+	hydra->kernel_interface->flush_sas(hydra->kernel_interface);
+	hydra->kernel_interface->flush_policies(hydra->kernel_interface);
+	lib->plugins->unload(lib->plugins);
 }

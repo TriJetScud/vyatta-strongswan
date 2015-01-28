@@ -44,7 +44,7 @@ struct private_user_controller_t {
 	user_t *user;
 
 	/**
-	 * minimum required password lenght
+	 * minimum required password length
 	 */
 	u_int password_length;
 };
@@ -64,7 +64,11 @@ static chunk_t hash_password(char *login, char *password)
 	}
 	data = chunk_cata("cc",	chunk_create(login, strlen(login)),
 							chunk_create(password, strlen(password)));
-	hasher->allocate_hash(hasher, data, &hash);
+	if (!hasher->allocate_hash(hasher, data, &hash))
+	{
+		hasher->destroy(hasher);
+		return chunk_empty;
+	}
 	hasher->destroy(hasher);
 	return hash;
 }
@@ -72,7 +76,7 @@ static chunk_t hash_password(char *login, char *password)
 /**
  * Login a user.
  */
-static void login(private_user_controller_t *this, request_t *request)
+static void login(private_user_controller_t *this, fast_request_t *request)
 {
 	if (request->get_query_data(request, "submit"))
 	{
@@ -111,7 +115,7 @@ static void login(private_user_controller_t *this, request_t *request)
 /**
  * Logout a user.
  */
-static void logout(private_user_controller_t *this, request_t *request)
+static void logout(private_user_controller_t *this, fast_request_t *request)
 {
 	request->redirect(request, "user/login");
 	request->close_session(request);
@@ -120,8 +124,8 @@ static void logout(private_user_controller_t *this, request_t *request)
 /**
  * verify a user entered username for validity
  */
-static bool verify_login(private_user_controller_t *this, request_t *request,
-						 char *login)
+static bool verify_login(private_user_controller_t *this,
+						 fast_request_t *request, char *login)
 {
 	if (!login || *login == '\0')
 	{
@@ -152,7 +156,8 @@ static bool verify_login(private_user_controller_t *this, request_t *request,
 /**
  * verify a user entered password for validity
  */
-static bool verify_password(private_user_controller_t *this, request_t *request,
+static bool verify_password(private_user_controller_t *this,
+							fast_request_t *request,
 							char *password, char *confirm)
 {
 	if (!password || *password == '\0')
@@ -177,7 +182,7 @@ static bool verify_password(private_user_controller_t *this, request_t *request,
 /**
  * Register a user.
  */
-static void add(private_user_controller_t *this, request_t *request)
+static void add(private_user_controller_t *this, fast_request_t *request)
 {
 	char *login = "";
 
@@ -218,7 +223,7 @@ static void add(private_user_controller_t *this, request_t *request)
 /**
  * Edit the logged in user
  */
-static void edit(private_user_controller_t *this, request_t *request)
+static void edit(private_user_controller_t *this, fast_request_t *request)
 {
 	enumerator_t *query;
 	char *old_login;
@@ -293,18 +298,15 @@ static void edit(private_user_controller_t *this, request_t *request)
 	request->render(request, "templates/user/edit.cs");
 }
 
-/**
- * Implementation of controller_t.get_name
- */
-static char* get_name(private_user_controller_t *this)
+METHOD(fast_controller_t, get_name, char*,
+	private_user_controller_t *this)
 {
 	return "user";
 }
 
-/**
- * Implementation of controller_t.handle
- */
-static void handle(private_user_controller_t *this, request_t *request, char *action)
+METHOD(fast_controller_t, handle, void,
+	private_user_controller_t *this, fast_request_t *request, char *action,
+	char *p2, char *p3, char *p4, char *p5)
 {
 	if (action)
 	{
@@ -332,10 +334,8 @@ static void handle(private_user_controller_t *this, request_t *request, char *ac
 	request->redirect(request, "user/login");
 }
 
-/**
- * Implementation of controller_t.destroy
- */
-static void destroy(private_user_controller_t *this)
+METHOD(fast_controller_t, destroy, void,
+	private_user_controller_t *this)
 {
 	free(this);
 }
@@ -343,19 +343,23 @@ static void destroy(private_user_controller_t *this)
 /*
  * see header file
  */
-controller_t *user_controller_create(user_t *user, database_t *db)
+fast_controller_t *user_controller_create(user_t *user, database_t *db)
 {
-	private_user_controller_t *this= malloc_thing(private_user_controller_t);
+	private_user_controller_t *this;
 
-	this->public.controller.get_name = (char*(*)(controller_t*))get_name;
-	this->public.controller.handle = (void(*)(controller_t*, request_t*, char*, char*, char*, char*, char*))handle;
-	this->public.controller.destroy = (void(*)(controller_t*))destroy;
-
-	this->user = user;
-	this->db = db;
-	this->password_length = lib->settings->get_int(lib->settings,
-												   "medsrv.password_length", 6);
+	INIT(this,
+		.public = {
+			.controller = {
+				.get_name = _get_name,
+				.handle = _handle,
+				.destroy = _destroy,
+			},
+		},
+		.user = user,
+		.db = db,
+		.password_length = lib->settings->get_int(lib->settings,
+												  "medsrv.password_length", 6),
+	);
 
 	return &this->public.controller;
 }
-

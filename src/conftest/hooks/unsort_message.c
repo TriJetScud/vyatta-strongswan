@@ -45,9 +45,9 @@ struct private_unsort_message_t {
 
 METHOD(listener_t, message, bool,
 	private_unsort_message_t *this, ike_sa_t *ike_sa, message_t *message,
-	bool incoming)
+	bool incoming, bool plain)
 {
-	if (!incoming &&
+	if (!incoming && plain &&
 		message->get_request(message) == this->req &&
 		message->get_message_id(message) == this->id)
 	{
@@ -69,8 +69,7 @@ METHOD(listener_t, message, bool,
 		order = enumerator_create_token(this->order, ", ", " ");
 		while (order->enumerate(order, &name))
 		{
-			type = enum_from_name(payload_type_short_names, name);
-			if (type != -1)
+			if (enum_from_name(payload_type_short_names, name, &type))
 			{
 				enumerator = list->create_enumerator(list);
 				while (enumerator->enumerate(enumerator, &payload))

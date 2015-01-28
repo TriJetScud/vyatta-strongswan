@@ -26,6 +26,12 @@
 #ifndef TLS_H_
 #define TLS_H_
 
+/**
+ * Maximum size of a TLS fragment
+ * as defined by section 6.2.1. "Fragmentation" of RFC 5246 TLS 1.2
+ */
+#define TLS_MAX_FRAGMENT_LEN	16384
+
 typedef enum tls_version_t tls_version_t;
 typedef enum tls_content_type_t tls_content_type_t;
 typedef enum tls_handshake_type_t tls_handshake_type_t;
@@ -35,6 +41,7 @@ typedef struct tls_t tls_t;
 #include <library.h>
 
 #include "tls_application.h"
+#include "tls_cache.h"
 
 /**
  * TLS/SSL version numbers
@@ -100,6 +107,8 @@ enum tls_purpose_t {
 	TLS_PURPOSE_EAP_PEAP,
 	/** non-EAP TLS */
 	TLS_PURPOSE_GENERIC,
+	/** non-EAP TLS accepting NULL encryption */
+	TLS_PURPOSE_GENERIC_NULLOK,
 	/** EAP binding for TNC */
 	TLS_PURPOSE_EAP_TNC
 };
@@ -186,6 +195,27 @@ struct tls_t {
 	bool (*is_server)(tls_t *this);
 
 	/**
+	 * Return the server identity.
+	 *
+	 * @return			server identity
+	 */
+	identification_t* (*get_server_id)(tls_t *this);
+
+	/**
+	 * Set the peer identity.
+	 *
+	 * @param id		peer identity
+	 */
+	void (*set_peer_id)(tls_t *this, identification_t *id);
+
+	/**
+	 * Return the peer identity.
+	 *
+	 * @return			peer identity
+	 */
+	identification_t* (*get_peer_id)(tls_t *this);
+
+	/**
 	 * Get the negotiated TLS/SSL version.
 	 *
 	 * @return			negotiated TLS version
@@ -228,6 +258,11 @@ struct tls_t {
 };
 
 /**
+ * Dummy libtls initialization function needed for integrity test
+ */
+void libtls_init(void);
+
+/**
  * Create a tls instance.
  *
  * @param is_server			TRUE to act as server, FALSE for client
@@ -235,10 +270,11 @@ struct tls_t {
  * @param peer				peer identity, NULL for no client authentication
  * @param purpose			purpose this TLS stack instance is used for
  * @param application		higher layer application or NULL if none
+ * @param cache				session cache to use, or NULL
  * @return					TLS stack
  */
 tls_t *tls_create(bool is_server, identification_t *server,
 				  identification_t *peer, tls_purpose_t purpose,
-				  tls_application_t *application);
+				  tls_application_t *application, tls_cache_t *cache);
 
 #endif /** TLS_H_ @}*/

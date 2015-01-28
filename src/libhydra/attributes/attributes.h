@@ -24,7 +24,7 @@
 
 typedef enum configuration_attribute_type_t configuration_attribute_type_t;
 
-#include <enum.h>
+#include <utils/utils.h>
 
 /**
  * Type of the attribute, as in IKEv2 RFC 3.15.1 or IKEv1 ModeConfig.
@@ -48,6 +48,7 @@ enum configuration_attribute_type_t {
 	MIP6_HOME_PREFIX        = 16,
 	INTERNAL_IP6_LINK       = 17,
 	INTERNAL_IP6_PREFIX     = 18,
+	HOME_AGENT_ADDRESS		= 19,
 	/* XAUTH attributes */
 	XAUTH_TYPE              = 16520,
 	XAUTH_USER_NAME         = 16521,

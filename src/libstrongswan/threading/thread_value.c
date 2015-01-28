@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009 Tobias Brunner
+ * Copyright (C) 2009-2012 Tobias Brunner
  * Hochschule fuer Technik Rapperswil
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -33,44 +33,59 @@ struct private_thread_value_t {
 	 */
 	pthread_key_t key;
 
+	/**
+	 * Destructor to cleanup the value of the thread destroying this object
+	 */
+	thread_cleanup_t destructor;
+
 };
 
-
-/**
- * Implementation of thread_value_t.set.
- */
-static void set(private_thread_value_t *this, void *val)
+METHOD(thread_value_t, set, void,
+	private_thread_value_t *this, void *val)
 {
 	pthread_setspecific(this->key, val);
 }
 
-/**
- * Implementation of thread_value_t.get.
- */
-static void *get(private_thread_value_t *this)
+METHOD(thread_value_t, get, void*,
+	private_thread_value_t *this)
 {
 	return pthread_getspecific(this->key);
 }
 
-/**
- * Implementation of thread_value_t.destroy.
- */
-static void destroy(private_thread_value_t *this)
+METHOD(thread_value_t, destroy, void,
+	private_thread_value_t *this)
 {
+	void *val;
+
+	/* the destructor is not called automatically for the thread calling
+	 * pthread_key_delete() */
+	if (this->destructor)
+	{
+		val = pthread_getspecific(this->key);
+		if (val)
+		{
+			this->destructor(val);
+		}
+	}
 	pthread_key_delete(this->key);
 	free(this);
 }
-
 
 /**
  * Described in header.
  */
 thread_value_t *thread_value_create(thread_cleanup_t destructor)
 {
-	private_thread_value_t *this = malloc_thing(private_thread_value_t);
-	this->public.set = (void(*)(thread_value_t*,void*))set;
-	this->public.get = (void*(*)(thread_value_t*))get;
-	this->public.destroy = (void(*)(thread_value_t*))destroy;
+	private_thread_value_t *this;
+
+	INIT(this,
+		.public = {
+			.set = _set,
+			.get = _get,
+			.destroy = _destroy,
+		},
+		.destructor = destructor,
+	);
 
 	pthread_key_create(&this->key, destructor);
 	return &this->public;

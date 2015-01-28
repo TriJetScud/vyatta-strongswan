@@ -16,7 +16,7 @@
 #include "curl_plugin.h"
 
 #include <library.h>
-#include <debug.h>
+#include <utils/debug.h>
 #include "curl_fetcher.h"
 
 #include <curl/curl.h>
@@ -32,7 +32,106 @@ struct private_curl_plugin_t {
 	 * public functions
 	 */
 	curl_plugin_t public;
+
+	/**
+	 * Supported features, CURL protocols + 1
+	 */
+	plugin_feature_t *features;
+
+	/**
+	 * Number of supported features
+	 */
+	int count;
 };
+
+/**
+ * Append a feature to supported feature list
+ */
+static void add_feature(private_curl_plugin_t *this, plugin_feature_t f)
+{
+	this->features = realloc(this->features, ++this->count * sizeof(f));
+	this->features[this->count - 1] = f;
+}
+
+/**
+ * Try to add a feature, and the appropriate SSL dependencies
+ */
+static void add_feature_with_ssl(private_curl_plugin_t *this, const char *ssl,
+								 char *proto, plugin_feature_t f)
+{
+	/* http://curl.haxx.se/libcurl/c/libcurl-tutorial.html#Multi-threading */
+	if (strpfx(ssl, "OpenSSL"))
+	{
+		add_feature(this, f);
+		add_feature(this, PLUGIN_DEPENDS(CUSTOM, "openssl-threading"));
+	}
+	else if (strpfx(ssl, "GnuTLS"))
+	{
+		add_feature(this, f);
+		add_feature(this, PLUGIN_DEPENDS(CUSTOM, "gcrypt-threading"));
+	}
+	else if (strpfx(ssl, "NSS"))
+	{
+		add_feature(this, f);
+	}
+	else
+	{
+		DBG1(DBG_LIB, "curl SSL backend '%s' not supported, %s disabled",
+			 ssl, proto);
+	}
+}
+
+/**
+ * Get supported protocols, build plugin feature set
+ */
+static bool query_protocols(private_curl_plugin_t *this)
+{
+
+	struct {
+		/* protocol we are interested in, suffixed with "://" */
+		char *name;
+		/* require SSL library initialization? */
+		bool ssl;
+	} protos[] = {
+		{ "file://",		FALSE,	},
+		{ "http://",		FALSE,	},
+		{ "https://",		TRUE,	},
+		{ "ftp://",			FALSE,	},
+	};
+	curl_version_info_data *info;
+	char *name;
+	int i, j;
+
+	add_feature(this, PLUGIN_REGISTER(FETCHER, curl_fetcher_create));
+
+	info = curl_version_info(CURLVERSION_NOW);
+
+	for (i = 0; info->protocols[i]; i++)
+	{
+		for (j = 0; j < countof(protos); j++)
+		{
+			name = protos[j].name;
+			if (strlen(info->protocols[i]) == strlen(name) - strlen("://"))
+			{
+				if (strneq(info->protocols[i], name,
+						   strlen(name) - strlen("://")))
+				{
+					if (protos[j].ssl)
+					{
+						add_feature_with_ssl(this, info->ssl_version, name,
+									PLUGIN_PROVIDE(FETCHER, name));
+					}
+					else
+					{
+						add_feature(this, PLUGIN_PROVIDE(FETCHER, name));
+					}
+				}
+			}
+		}
+	}
+
+	return this->count > 1;
+}
 
 METHOD(plugin_t, get_name, char*,
 	private_curl_plugin_t *this)
@@ -40,12 +139,18 @@ METHOD(plugin_t, get_name, char*,
 	return "curl";
 }
 
+METHOD(plugin_t, get_features, int,
+	private_curl_plugin_t *this, plugin_feature_t *features[])
+{
+	*features = this->features;
+	return this->count;
+}
+
 METHOD(plugin_t, destroy, void,
 	private_curl_plugin_t *this)
 {
-	lib->fetcher->remove_fetcher(lib->fetcher,
-								 (fetcher_constructor_t)curl_fetcher_create);
 	curl_global_cleanup();
+	free(this->features);
 	free(this);
 }
 
@@ -61,29 +166,32 @@ plugin_t *curl_plugin_create()
 		.public = {
 			.plugin = {
 				.get_name = _get_name,
-				.reload = (void*)return_false,
+				.get_features = _get_features,
 				.destroy = _destroy,
 			},
 		},
 	);
 
-	res = curl_global_init(CURL_GLOBAL_NOTHING);
-	if (res == CURLE_OK)
+	res = curl_global_init(CURL_GLOBAL_SSL);
+	if (res != CURLE_OK)
 	{
-		lib->fetcher->add_fetcher(lib->fetcher,
-						(fetcher_constructor_t)curl_fetcher_create, "file://");
-		lib->fetcher->add_fetcher(lib->fetcher,
-						(fetcher_constructor_t)curl_fetcher_create, "http://");
-		lib->fetcher->add_fetcher(lib->fetcher,
-						(fetcher_constructor_t)curl_fetcher_create, "https://");
-		lib->fetcher->add_fetcher(lib->fetcher,
-						(fetcher_constructor_t)curl_fetcher_create, "ftp://");
+		/* no SSL support? Try without */
+		res = curl_global_init(CURL_GLOBAL_NOTHING);
 	}
-	else
+	if (res != CURLE_OK)
 	{
-		DBG1(DBG_LIB, "global libcurl initializing failed: %s, curl disabled",
+		DBG1(DBG_LIB, "global libcurl initializing failed: %s",
 			 curl_easy_strerror(res));
+		destroy(this);
+		return NULL;
 	}
+
+	if (!query_protocols(this))
+	{
+		DBG1(DBG_LIB, "no usable CURL protocols found, curl disabled");
+		destroy(this);
+		return NULL;
+	}
+
 	return &this->public.plugin;
 }
-

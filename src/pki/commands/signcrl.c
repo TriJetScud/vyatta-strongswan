@@ -17,8 +17,8 @@
 
 #include "pki.h"
 
-#include <debug.h>
-#include <utils/linked_list.h>
+#include <utils/debug.h>
+#include <collections/linked_list.h>
 #include <credentials/certificates/certificate.h>
 #include <credentials/certificates/x509.h>
 #include <credentials/certificates/crl.h>
@@ -120,20 +120,20 @@ static int sign_crl()
 	hash_algorithm_t digest = HASH_SHA1;
 	char *arg, *cacert = NULL, *cakey = NULL, *lastupdate = NULL, *error = NULL;
 	char *basecrl = NULL;
-	char serial[512], crl_serial[8], *keyid = NULL;
+	char serial[512], *keyid = NULL;
 	int serial_len = 0;
 	crl_reason_t reason = CRL_REASON_UNSPECIFIED;
 	time_t thisUpdate, nextUpdate, date = time(NULL);
-	int lifetime = 15;
+	time_t lifetime = 15 * 24 * 60 * 60;
+	char *datetu = NULL, *datenu = NULL, *dateform = NULL;
 	linked_list_t *list, *cdps;
 	enumerator_t *enumerator, *lastenum = NULL;
 	x509_cdp_t *cdp;
-	chunk_t encoding = chunk_empty, baseCrlNumber = chunk_empty;
+	chunk_t crl_serial = chunk_empty, baseCrlNumber = chunk_empty;
+	chunk_t encoding = chunk_empty;
 
 	list = linked_list_create();
 	cdps = linked_list_create();
-
-	memset(crl_serial, 0, sizeof(crl_serial));
 
 	while (TRUE)
 	{
@@ -142,8 +142,7 @@ static int sign_crl()
 			case 'h':
 				goto usage;
 			case 'g':
-				digest = get_digest(arg);
-				if (digest == HASH_UNKNOWN)
+				if (!enum_from_name(hash_algorithm_short_names, arg, &digest))
 				{
 					error = "invalid --digest type";
 					goto usage;
@@ -162,12 +161,21 @@ static int sign_crl()
 				lastupdate = arg;
 				continue;
 			case 'l':
-				lifetime = atoi(arg);
+				lifetime = atoi(arg) * 24 * 60 * 60;
 				if (!lifetime)
 				{
-					error = "invalid lifetime";
+					error = "invalid --lifetime value";
 					goto usage;
 				}
+				continue;
+			case 'D':
+				dateform = arg;
+				continue;
+			case 'F':
+				datetu = arg;
+				continue;
+			case 'T':
+				datenu = arg;
 				continue;
 			case 'z':
 				serial_len = read_serial(arg, serial, sizeof(serial));
@@ -276,6 +284,12 @@ static int sign_crl()
 		error = "--cakey or --keyid is required";
 		goto usage;
 	}
+	if (!calculate_lifetime(dateform, datetu, datenu, lifetime,
+							&thisUpdate, &nextUpdate))
+	{
+		error = "invalid --this/next-update datetime";
+		goto usage;
+	}
 
 	ca = lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509,
 							BUILD_FROM_FILE, cacert, BUILD_END);
@@ -321,9 +335,11 @@ static int sign_crl()
 		error = "CA private key does not match CA certificate";
 		goto error;
 	}
-
-	thisUpdate = time(NULL);
-	nextUpdate = thisUpdate + lifetime * 24 * 60 * 60;
+	if (private->get_type(private) == KEY_BLISS)
+	{
+		/* currently only SHA-512 is supported */
+		digest = HASH_SHA512;
+	}
 
 	if (basecrl)
 	{
@@ -334,9 +350,8 @@ static int sign_crl()
 			error = "loading base CRL failed";
 			goto error;
 		}
-		memcpy(crl_serial, lastcrl->get_serial(lastcrl).ptr,
-			   min(lastcrl->get_serial(lastcrl).len, sizeof(crl_serial)));
 		baseCrlNumber = chunk_clone(lastcrl->get_serial(lastcrl));
+		crl_serial = baseCrlNumber;
 		DESTROY_IF((certificate_t*)lastcrl);
 		lastcrl = NULL;
 	}
@@ -350,22 +365,31 @@ static int sign_crl()
 			error = "loading lastUpdate CRL failed";
 			goto error;
 		}
-		memcpy(crl_serial, lastcrl->get_serial(lastcrl).ptr,
-			   min(lastcrl->get_serial(lastcrl).len, sizeof(crl_serial)));
+		crl_serial = lastcrl->get_serial(lastcrl);
 		lastenum = lastcrl->create_enumerator(lastcrl);
 	}
 	else
 	{
+		crl_serial = chunk_from_chars(0x00);
 		lastenum = enumerator_create_empty();
 	}
 
-	chunk_increment(chunk_create(crl_serial, sizeof(crl_serial)));
+	/* remove superfluous leading zeros */
+	while (crl_serial.len > 1 && crl_serial.ptr[0] == 0x00 &&
+		  (crl_serial.ptr[1] & 0x80) == 0x00)
+	{
+		crl_serial = chunk_skip_zero(crl_serial);
+	}
+	crl_serial = chunk_clone(crl_serial);
+
+	/* increment the serial number by one */
+	chunk_increment(crl_serial);
 
 	enumerator = enumerator_create_filter(list->create_enumerator(list),
 										  (void*)filter, NULL, NULL);
 	crl = lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509_CRL,
 			BUILD_SIGNING_KEY, private, BUILD_SIGNING_CERT, ca,
-			BUILD_SERIAL, chunk_create(crl_serial, sizeof(crl_serial)),
+			BUILD_SERIAL, crl_serial,
 			BUILD_NOT_BEFORE_TIME, thisUpdate, BUILD_NOT_AFTER_TIME, nextUpdate,
 			BUILD_REVOKED_ENUMERATOR, enumerator,
 			BUILD_REVOKED_ENUMERATOR, lastenum, BUILD_DIGEST_ALG, digest,
@@ -374,6 +398,7 @@ static int sign_crl()
 	enumerator->destroy(enumerator);
 	lastenum->destroy(lastenum);
 	DESTROY_IF((certificate_t*)lastcrl);
+	free(crl_serial.ptr);
 
 	if (!crl)
 	{
@@ -385,6 +410,7 @@ static int sign_crl()
 		error = "encoding CRL failed";
 		goto error;
 	}
+	set_file_mode(stdout, form);
 	if (fwrite(encoding.ptr, encoding.len, 1, stdout) != 1)
 	{
 		error = "writing CRL failed";
@@ -421,19 +447,22 @@ static void __attribute__ ((constructor))reg()
 	command_register((command_t) {
 		sign_crl, 'c', "signcrl",
 		"issue a CRL using a CA certificate and key",
-		{"--cacert file --cakey file | --cakeyid hex --lifetime days",
-		 "[--lastcrl crl] [--basecrl crl] [--crluri uri ]+",
-		 "[  [--reason key-compromise|ca-compromise|affiliation-changed|",
+		{"--cacert file --cakey file|--cakeyid hex [--lifetime days]",
+		 "  [--lastcrl crl] [--basecrl crl] [--crluri uri]+",
+		 "  [[--reason key-compromise|ca-compromise|affiliation-changed|",
 		 "             superseded|cessation-of-operation|certificate-hold]",
-		 "   [--date timestamp]",
-		 "    --cert file | --serial hex ]*",
-		 "[--digest md5|sha1|sha224|sha256|sha384|sha512] [--outform der|pem]"},
+		 "   [--date timestamp] --cert file|--serial hex]*",
+		 "  [--digest md5|sha1|sha224|sha256|sha384|sha512]",
+		 "  [--outform der|pem]"},
 		{
 			{"help",		'h', 0, "show usage information"},
 			{"cacert",		'c', 1, "CA certificate file"},
 			{"cakey",		'k', 1, "CA private key file"},
 			{"cakeyid",		'x', 1, "keyid on smartcard of CA private key"},
 			{"lifetime",	'l', 1, "days the CRL gets a nextUpdate, default: 15"},
+			{"this-update",	'F', 1, "date/time the validity of the CRL starts"},
+			{"next-update",	'T', 1, "date/time the validity of the CRL ends"},
+			{"dateform",	'D', 1, "strptime(3) input format, default: %d.%m.%y %T"},
 			{"lastcrl",		'a', 1, "CRL of lastUpdate to copy revocations from"},
 			{"basecrl",		'b', 1, "base CRL to create a delta CRL for"},
 			{"crluri",		'u', 1, "freshest delta CRL URI to include"},

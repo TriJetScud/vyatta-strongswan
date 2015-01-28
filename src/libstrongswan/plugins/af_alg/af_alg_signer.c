@@ -52,7 +52,7 @@ static struct {
 	char *name;
 	size_t block_size;
 	size_t key_size;
-} algs[] = {
+} algs[AF_ALG_SIGNER] = {
 	{AUTH_HMAC_SHA1_96,			"hmac(sha1)",		12,		20,	},
 	{AUTH_HMAC_SHA1_128,		"hmac(sha1)",		16,		20,	},
 	{AUTH_HMAC_SHA1_160,		"hmac(sha1)",		20,		20,	},
@@ -64,6 +64,7 @@ static struct {
 	{AUTH_HMAC_SHA2_384_192,	"hmac(sha384)",		24,		48,	},
 	{AUTH_HMAC_SHA2_384_384,	"hmac(sha384)",		48,		48,	},
 	{AUTH_HMAC_SHA2_512_256,	"hmac(sha512)",		32,		64,	},
+	{AUTH_HMAC_SHA2_512_512,	"hmac(sha512)",		64,		64,	},
 	{AUTH_AES_XCBC_96,			"xcbc(aes)",		12,		16,	},
 	{AUTH_CAMELLIA_XCBC_96,		"xcbc(camellia)",	12,		16,	},
 };
@@ -71,7 +72,7 @@ static struct {
 /**
  * See header.
  */
-void af_alg_signer_probe(char *plugin)
+void af_alg_signer_probe(plugin_feature_t *features, int *pos)
 {
 	af_alg_ops_t *ops;
 	int i;
@@ -82,8 +83,7 @@ void af_alg_signer_probe(char *plugin)
 		if (ops)
 		{
 			ops->destroy(ops);
-			lib->crypto->add_signer(lib->crypto, algs[i].id, plugin,
-							(signer_constructor_t)af_alg_signer_create);
+			features[(*pos)++] = PLUGIN_PROVIDE(SIGNER, algs[i].id);
 		}
 	}
 }
@@ -108,24 +108,21 @@ static size_t lookup_alg(integrity_algorithm_t algo, char **name,
 	return 0;
 }
 
-METHOD(signer_t, get_signature, void,
+METHOD(signer_t, get_signature, bool,
 	private_af_alg_signer_t *this, chunk_t data, u_int8_t *buffer)
 {
-	this->ops->hash(this->ops, data, buffer, this->block_size);
+	return this->ops->hash(this->ops, data, buffer, this->block_size);
 }
 
-METHOD(signer_t, allocate_signature, void,
+METHOD(signer_t, allocate_signature, bool,
 	private_af_alg_signer_t *this, chunk_t data, chunk_t *chunk)
 {
 	if (chunk)
 	{
 		*chunk = chunk_alloc(this->block_size);
-		get_signature(this, data, chunk->ptr);
+		return get_signature(this, data, chunk->ptr);
 	}
-	else
-	{
-		get_signature(this, data, NULL);
-	}
+	return get_signature(this, data, NULL);
 }
 
 METHOD(signer_t, verify_signature, bool,
@@ -137,7 +134,10 @@ METHOD(signer_t, verify_signature, bool,
 	{
 		return FALSE;
 	}
-	get_signature(this, data, sig);
+	if (!get_signature(this, data, sig))
+	{
+		return FALSE;
+	}
 	return memeq(signature.ptr, sig, signature.len);
 }
 
@@ -153,10 +153,10 @@ METHOD(signer_t, get_block_size, size_t,
 	return this->block_size;
 }
 
-METHOD(signer_t, set_key, void,
+METHOD(signer_t, set_key, bool,
 	private_af_alg_signer_t *this, chunk_t key)
 {
-	this->ops->set_key(this->ops, key);
+	return this->ops->set_key(this->ops, key);
 }
 
 METHOD(signer_t, destroy, void,

@@ -39,7 +39,7 @@ struct private_eap_tls_t {
 };
 
 /** Maximum number of EAP-TLS messages/fragments allowed */
-#define MAX_MESSAGE_COUNT 32 
+#define MAX_MESSAGE_COUNT 32
 /** Default size of a EAP-TLS fragment */
 #define MAX_FRAGMENT_LEN 1024
 
@@ -144,12 +144,14 @@ static eap_tls_t *eap_tls_create(identification_t *server,
 	);
 
 	frag_size = lib->settings->get_int(lib->settings,
-					"charon.plugins.eap-tls.fragment_size", MAX_FRAGMENT_LEN);
+					"%s.plugins.eap-tls.fragment_size", MAX_FRAGMENT_LEN,
+					lib->ns);
 	max_msg_count = lib->settings->get_int(lib->settings,
-					"charon.plugins.eap-tls.max_message_count", MAX_MESSAGE_COUNT);
+					"%s.plugins.eap-tls.max_message_count", MAX_MESSAGE_COUNT,
+					lib->ns);
 	include_length = lib->settings->get_bool(lib->settings,
-                    "charon.plugins.eap-tls.include_length", TRUE);
-	tls = tls_create(is_server, server, peer, TLS_PURPOSE_EAP_TLS, NULL);
+					"%s.plugins.eap-tls.include_length", TRUE, lib->ns);
+	tls = tls_create(is_server, server, peer, TLS_PURPOSE_EAP_TLS, NULL, NULL);
 	this->tls_eap = tls_eap_create(EAP_TLS, tls, frag_size, max_msg_count,
 												 include_length);
 	if (!this->tls_eap)

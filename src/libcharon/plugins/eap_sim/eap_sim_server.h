@@ -21,15 +21,12 @@
 #ifndef EAP_SIM_SERVER_H_
 #define EAP_SIM_SERVER_H_
 
-#include <sa/authenticators/eap/eap_method.h>
+#include <sa/eap/eap_method.h>
 
 typedef struct eap_sim_server_t eap_sim_server_t;
 
 /**
  * EAP-SIM server implementation.
- *
- * This EAP-SIM module uses sim_provider_t implementations for triplet
- * calculation, found via the eap_sim_manager_t.
  */
 struct eap_sim_server_t {
 

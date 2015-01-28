@@ -16,6 +16,7 @@
 #include "load_tester_creds.h"
 
 #include <time.h>
+#include <sys/stat.h>
 
 #include <daemon.h>
 #include <credentials/keys/shared_key.h>
@@ -44,14 +45,34 @@ struct private_load_tester_creds_t {
 	certificate_t *ca;
 
 	/**
+	 * Trusted CA certificates, including issuer CA
+	 */
+	linked_list_t *cas;
+
+	/**
+	 * Digest algorithm to issue certificates
+	 */
+	hash_algorithm_t digest;
+
+	/**
 	 * serial number to issue certificates
 	 */
 	u_int32_t serial;
 
 	/**
-	 * Preshared key
+	 * Preshared key for IKE
 	 */
-	shared_key_t *shared;
+	shared_key_t *psk;
+
+	/**
+	 * Password for EAP
+	 */
+	shared_key_t *pwd;
+
+	/**
+	 * List of certificate distribution points to include in generated certs
+	 */
+	linked_list_t *cdps;
 };
 
 /**
@@ -131,7 +152,7 @@ CwMLbJ7vQqwPHXRitDmNkEOK9H+vRnDf
 -----END CERTIFICATE-----
 
  */
-char cert[] = {
+static char cert[] = {
   0x30,0x82,0x01,0xf4,0x30,0x82,0x01,0x5d,0xa0,0x03,0x02,0x01,0x02,0x02,0x01,0x00,
   0x30,0x0d,0x06,0x09,0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x05,0x05,0x00,0x30,
   0x37,0x31,0x0c,0x30,0x0a,0x06,0x03,0x55,0x04,0x03,0x13,0x03,0x73,0x72,0x76,0x31,
@@ -168,17 +189,95 @@ char cert[] = {
 
 
 /**
- * A preshared key
+ * Default IKE preshared key
  */
-static char psk[] = {
-  0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08
-};
+static char *default_psk = "default-psk";
 
 /**
- * Implements credential_set_t.create_private_enumerator
+ * Default EAP password for EAP
  */
-static enumerator_t* create_private_enumerator(private_load_tester_creds_t *this,
-							key_type_t type, identification_t *id)
+static char *default_pwd = "default-pwd";
+
+
+/**
+ * Load the private key, hard-coded or from a file
+ */
+static private_key_t *load_issuer_key()
+{
+	char *path;
+
+	path = lib->settings->get_str(lib->settings,
+						"%s.plugins.load-tester.issuer_key", NULL, lib->ns);
+	if (!path)
+	{
+		return lib->creds->create(lib->creds, CRED_PRIVATE_KEY, KEY_RSA,
+					BUILD_BLOB_ASN1_DER, chunk_create(private, sizeof(private)),
+					BUILD_END);
+	}
+	DBG1(DBG_CFG, "loading load-tester private key from '%s'", path);
+	return lib->creds->create(lib->creds, CRED_PRIVATE_KEY, KEY_RSA,
+					BUILD_FROM_FILE, path, BUILD_END);
+}
+
+/**
+ * Load the issuing certificate, hard-coded or from a file
+ */
+static certificate_t *load_issuer_cert()
+{
+	char *path;
+
+	path = lib->settings->get_str(lib->settings,
+						"%s.plugins.load-tester.issuer_cert", NULL, lib->ns);
+	if (!path)
+	{
+		return lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509,
+					BUILD_BLOB_ASN1_DER, chunk_create(cert, sizeof(cert)),
+					BUILD_X509_FLAG, X509_CA,
+					BUILD_END);
+	}
+	DBG1(DBG_CFG, "loading load-tester issuer cert from '%s'", path);
+	return lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509,
+					BUILD_FROM_FILE, path, BUILD_END);
+}
+
+/**
+ * Load (intermediate) CA certificates, hard-coded or from a file
+ */
+static void load_ca_certs(private_load_tester_creds_t *this)
+{
+	enumerator_t *enumerator;
+	certificate_t *cert;
+	struct stat st;
+	char *path;
+
+	path = lib->settings->get_str(lib->settings,
+							"%s.plugins.load-tester.ca_dir", NULL, lib->ns);
+	if (path)
+	{
+		enumerator = enumerator_create_directory(path);
+		if (enumerator)
+		{
+			while (enumerator->enumerate(enumerator, NULL, &path, &st))
+			{
+				if (S_ISREG(st.st_mode))
+				{
+					DBG1(DBG_CFG, "loading load-tester CA cert from '%s'", path);
+					cert = lib->creds->create(lib->creds,
+											CRED_CERTIFICATE, CERT_X509,
+											BUILD_FROM_FILE, path, BUILD_END);
+					if (cert)
+					{
+						this->cas->insert_last(this->cas, cert);
+					}
+				}
+			}
+			enumerator->destroy(enumerator);
+		}
+	}
+}
+
+METHOD(credential_set_t, create_private_enumerator, enumerator_t*,
+	private_load_tester_creds_t *this, key_type_t type, identification_t *id)
 {
 	if (this->private == NULL)
 	{
@@ -198,15 +297,16 @@ static enumerator_t* create_private_enumerator(private_load_tester_creds_t *this
 	return enumerator_create_single(this->private, NULL);
 }
 
-/**
- * Implements credential_set_t.create_cert_enumerator
- */
-static enumerator_t* create_cert_enumerator(private_load_tester_creds_t *this,
-							certificate_type_t cert, key_type_t key,
-							identification_t *id, bool trusted)
+METHOD(credential_set_t, create_cert_enumerator, enumerator_t*,
+	private_load_tester_creds_t *this, certificate_type_t cert, key_type_t key,
+	identification_t *id, bool trusted)
 {
-	certificate_t *peer_cert;
+	enumerator_t *enumerator;
+	certificate_t *peer_cert, *ca_cert;
 	public_key_t *peer_key, *ca_key;
+	identification_t *dn = NULL;
+	linked_list_t *sans;
+	char buf[128];
 	u_int32_t serial;
 	time_t now;
 
@@ -224,7 +324,7 @@ static enumerator_t* create_cert_enumerator(private_load_tester_creds_t *this,
 	}
 	if (!id)
 	{
-		return enumerator_create_single(this->ca, NULL);
+		return this->cas->create_enumerator(this->cas);
 	}
 	ca_key = this->ca->get_public_key(this->ca);
 	if (ca_key)
@@ -236,26 +336,57 @@ static enumerator_t* create_cert_enumerator(private_load_tester_creds_t *this,
 		}
 		ca_key->destroy(ca_key);
 	}
-	if (this->ca->has_subject(this->ca, id))
+	enumerator = this->cas->create_enumerator(this->cas);
+	while (enumerator->enumerate(enumerator, &ca_cert))
 	{
-		return enumerator_create_single(this->ca, NULL);
+		if (ca_cert->has_subject(ca_cert, id))
+		{
+			enumerator->destroy(enumerator);
+			return enumerator_create_single(ca_cert, NULL);
+		}
 	}
-	if (!trusted)
+	enumerator->destroy(enumerator);
+
+	if (!trusted && this->private)
 	{
 		/* peer certificate, generate on demand */
 		serial = htonl(++this->serial);
 		now = time(NULL);
+		sans = linked_list_create();
+
+		switch (id->get_type(id))
+		{
+			case ID_DER_ASN1_DN:
+				break;
+			case ID_FQDN:
+			case ID_RFC822_ADDR:
+			case ID_IPV4_ADDR:
+			case ID_IPV6_ADDR:
+				/* encode as subjectAltName, construct a sane DN */
+				sans->insert_last(sans, id);
+				snprintf(buf, sizeof(buf), "CN=%Y", id);
+				dn = identification_create_from_string(buf);
+				break;
+			default:
+				sans->destroy(sans);
+				return NULL;
+		}
 		peer_key = this->private->get_public_key(this->private);
 		peer_cert = lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509,
 									BUILD_SIGNING_KEY, this->private,
 									BUILD_SIGNING_CERT, this->ca,
+									BUILD_DIGEST_ALG, this->digest,
 									BUILD_PUBLIC_KEY, peer_key,
-									BUILD_SUBJECT, id,
+									BUILD_SUBJECT, dn ?: id,
+									BUILD_SUBJECT_ALTNAMES, sans,
 									BUILD_NOT_BEFORE_TIME, now - 60 * 60 * 24,
 									BUILD_NOT_AFTER_TIME, now + 60 * 60 * 24,
 									BUILD_SERIAL, chunk_from_thing(serial),
+									BUILD_CRL_DISTRIBUTION_POINTS, this->cdps,
 									BUILD_END);
 		peer_key->destroy(peer_key);
+		sans->destroy(sans);
+		DESTROY_IF(dn);
 		if (peer_cert)
 		{
 			return enumerator_create_single(peer_cert, (void*)peer_cert->destroy);
@@ -265,49 +396,113 @@ static enumerator_t* create_cert_enumerator(private_load_tester_creds_t *this,
 }
 
 /**
- * Implements credential_set_t.create_shared_enumerator
+ * Filter function for shared keys, returning ID matches
  */
-static enumerator_t* create_shared_enumerator(private_load_tester_creds_t *this,
-							shared_key_type_t type,	identification_t *me,
-							identification_t *other)
+static bool shared_filter(void *null, shared_key_t **in, shared_key_t **out,
+				void **un1, id_match_t *me, void **un2, id_match_t *other)
 {
-	return enumerator_create_single(this->shared, NULL);
+	*out = *in;
+	if (me)
+	{
+		*me = ID_MATCH_ANY;
+	}
+	if (other)
+	{
+		*other = ID_MATCH_ANY;
+	}
+	return TRUE;
 }
 
-/**
- * Implementation of load_tester_creds_t.destroy
- */
-static void destroy(private_load_tester_creds_t *this)
+METHOD(credential_set_t, create_shared_enumerator, enumerator_t*,
+	private_load_tester_creds_t *this, shared_key_type_t type,
+	identification_t *me, identification_t *other)
 {
+	shared_key_t *shared;
+
+	switch (type)
+	{
+		case SHARED_IKE:
+			shared = this->psk;
+			break;
+		case SHARED_EAP:
+			shared = this->pwd;
+			break;
+		default:
+			return NULL;
+	}
+	return enumerator_create_filter(enumerator_create_single(shared, NULL),
+									(void*)shared_filter, NULL, NULL);
+}
+
+METHOD(load_tester_creds_t, destroy, void,
+	private_load_tester_creds_t *this)
+{
+	this->cas->destroy_offset(this->cas, offsetof(certificate_t, destroy));
 	DESTROY_IF(this->private);
 	DESTROY_IF(this->ca);
-	this->shared->destroy(this->shared);
+	this->psk->destroy(this->psk);
+	this->pwd->destroy(this->pwd);
+	this->cdps->destroy_function(this->cdps, free);
 	free(this);
 }
 
 load_tester_creds_t *load_tester_creds_create()
 {
-	private_load_tester_creds_t *this = malloc_thing(private_load_tester_creds_t);
+	private_load_tester_creds_t *this;
+	char *pwd, *psk, *digest, *crl;
 
-	this->public.credential_set.create_shared_enumerator = (enumerator_t*(*)(credential_set_t*, shared_key_type_t, identification_t*, identification_t*))create_shared_enumerator;
-	this->public.credential_set.create_private_enumerator = (enumerator_t*(*) (credential_set_t*, key_type_t, identification_t*))create_private_enumerator;
-	this->public.credential_set.create_cert_enumerator = (enumerator_t*(*) (credential_set_t*,	certificate_type_t, key_type_t,identification_t *, bool))create_cert_enumerator;
-	this->public.credential_set.create_cdp_enumerator  = (enumerator_t*(*) (credential_set_t *,certificate_type_t, identification_t *))return_null;
-	this->public.credential_set.cache_cert = (void (*)(credential_set_t *, certificate_t *))nop;
-	this->public.destroy = (void(*) (load_tester_creds_t*))destroy;
+	psk = lib->settings->get_str(lib->settings,
+				"%s.plugins.load-tester.preshared_key", default_psk, lib->ns);
+	pwd = lib->settings->get_str(lib->settings,
+				"%s.plugins.load-tester.eap_password", default_pwd, lib->ns);
+	digest = lib->settings->get_str(lib->settings,
+				"%s.plugins.load-tester.digest", "sha1", lib->ns);
+	crl = lib->settings->get_str(lib->settings,
+				"%s.plugins.load-tester.crl", NULL, lib->ns);
 
-	this->private = lib->creds->create(lib->creds, CRED_PRIVATE_KEY, KEY_RSA,
-				BUILD_BLOB_ASN1_DER, chunk_create(private, sizeof(private)),
-				BUILD_END);
+	INIT(this,
+		.public = {
+			.credential_set = {
+				.create_shared_enumerator = _create_shared_enumerator,
+				.create_private_enumerator = _create_private_enumerator,
+				.create_cert_enumerator = _create_cert_enumerator,
+				.create_cdp_enumerator = (void*)return_null,
+				.cache_cert = (void*)nop,
+			},
+			.destroy = _destroy,
+		},
+		.private = load_issuer_key(),
+		.ca = load_issuer_cert(),
+		.cas = linked_list_create(),
+		.cdps = linked_list_create(),
+		.psk = shared_key_create(SHARED_IKE,
+								 chunk_clone(chunk_create(psk, strlen(psk)))),
+		.pwd = shared_key_create(SHARED_EAP,
+								 chunk_clone(chunk_create(pwd, strlen(pwd)))),
+	);
 
-	this->ca = lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509,
-				BUILD_BLOB_ASN1_DER, chunk_create(cert, sizeof(cert)),
-				BUILD_X509_FLAG, X509_CA,
-				BUILD_END);
+	if (this->ca)
+	{
+		this->cas->insert_last(this->cas, this->ca->get_ref(this->ca));
+	}
 
-	this->shared = shared_key_create(SHARED_IKE,
-									 chunk_clone(chunk_create(psk, sizeof(psk))));
-	this->serial = 0;
+	if (!enum_from_name(hash_algorithm_short_names, digest, &this->digest))
+	{
+		DBG1(DBG_CFG, "invalid load-tester digest: '%s', using sha1", digest);
+		this->digest = HASH_SHA1;
+	}
+
+	if (crl)
+	{
+		x509_cdp_t *cdp;
+
+		INIT(cdp,
+			.uri = crl,
+		);
+		this->cdps->insert_last(this->cdps, cdp);
+	}
+
+	load_ca_certs(this);
+
 	return &this->public;
 }
-

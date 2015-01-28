@@ -49,11 +49,6 @@ struct private_smp_t {
 	 * XML unix socket fd
 	 */
 	int socket;
-
-	/**
-	 * job accepting stroke messages
-	 */
-	callback_job_t *job;
 };
 
 ENUM(ike_sa_state_lower_names, IKE_CREATED, IKE_DELETING,
@@ -168,10 +163,12 @@ static void write_childend(xmlTextWriterPtr writer, child_sa_t *child, bool loca
 {
 	linked_list_t *list;
 
-	xmlTextWriterWriteFormatElement(writer, "spi", "%lx",
+	xmlTextWriterWriteFormatElement(writer, "spi", "%x",
 									htonl(child->get_spi(child, local)));
-	list = child->get_traffic_selectors(child, local);
+	list = linked_list_create_from_enumerator(
+									child->create_ts_enumerator(child, local));
 	write_networks(writer, "networks", list);
+	list->destroy(list);
 }
 
 /**
@@ -208,12 +205,13 @@ static void request_query_ikesa(xmlTextReaderPtr reader, xmlTextWriterPtr writer
 	/* <ikesalist> */
 	xmlTextWriterStartElement(writer, "ikesalist");
 
-	enumerator = charon->controller->create_ike_sa_enumerator(charon->controller);
+	enumerator = charon->controller->create_ike_sa_enumerator(
+													charon->controller, TRUE);
 	while (enumerator->enumerate(enumerator, &ike_sa))
 	{
 		ike_sa_id_t *id;
 		host_t *local, *remote;
-		iterator_t *children;
+		enumerator_t *children;
 		child_sa_t *child_sa;
 
 		id = ike_sa->get_id(ike_sa);
@@ -263,8 +261,8 @@ static void request_query_ikesa(xmlTextReaderPtr reader, xmlTextWriterPtr writer
 
 		/* <childsalist> */
 		xmlTextWriterStartElement(writer, "childsalist");
-		children = ike_sa->create_child_sa_iterator(ike_sa);
-		while (children->iterate(children, (void**)&child_sa))
+		children = ike_sa->create_child_sa_enumerator(ike_sa);
+		while (children->enumerate(children, (void**)&child_sa))
 		{
 			write_child(writer, child_sa);
 		}
@@ -293,18 +291,13 @@ static void request_query_config(xmlTextReaderPtr reader, xmlTextWriterPtr write
 	xmlTextWriterStartElement(writer, "configlist");
 
 	enumerator = charon->backends->create_peer_cfg_enumerator(charon->backends,
-														NULL, NULL, NULL, NULL);
+											NULL, NULL, NULL, NULL, IKE_ANY);
 	while (enumerator->enumerate(enumerator, &peer_cfg))
 	{
 		enumerator_t *children;
 		child_cfg_t *child_cfg;
 		ike_cfg_t *ike_cfg;
 		linked_list_t *list;
-
-		if (peer_cfg->get_ike_version(peer_cfg) != 2)
-		{	/* only IKEv2 connections yet */
-			continue;
-		}
 
 		/* <peerconfig> */
 		xmlTextWriterStartElement(writer, "peerconfig");
@@ -315,8 +308,10 @@ static void request_query_config(xmlTextReaderPtr reader, xmlTextWriterPtr write
 		/* <ikeconfig> */
 		ike_cfg = peer_cfg->get_ike_cfg(peer_cfg);
 		xmlTextWriterStartElement(writer, "ikeconfig");
-		xmlTextWriterWriteElement(writer, "local", ike_cfg->get_my_addr(ike_cfg));
-		xmlTextWriterWriteElement(writer, "remote", ike_cfg->get_other_addr(ike_cfg));
+		xmlTextWriterWriteElement(writer, "local",
+								  ike_cfg->get_my_addr(ike_cfg));
+		xmlTextWriterWriteElement(writer, "remote",
+								  ike_cfg->get_other_addr(ike_cfg));
 		xmlTextWriterEndElement(writer);
 		/* </ikeconfig> */
 
@@ -353,7 +348,7 @@ static void request_query_config(xmlTextReaderPtr reader, xmlTextWriterPtr write
  * callback which logs to a XML writer
  */
 static bool xml_callback(xmlTextWriterPtr writer, debug_t group, level_t level,
-						 ike_sa_t* ike_sa, char* format, va_list args)
+						 ike_sa_t* ike_sa, char* message)
 {
 	if (level <= 1)
 	{
@@ -362,7 +357,7 @@ static bool xml_callback(xmlTextWriterPtr writer, debug_t group, level_t level,
 		xmlTextWriterWriteFormatAttribute(writer, "level", "%d", level);
 		xmlTextWriterWriteFormatAttribute(writer, "source", "%N", debug_names, group);
 		xmlTextWriterWriteFormatAttribute(writer, "thread", "%u", thread_current_id());
-		xmlTextWriterWriteVFormatString(writer, format, args);
+		xmlTextWriterWriteString(writer, message);
 		xmlTextWriterEndElement(writer);
 		/* </item> */
 	}
@@ -394,7 +389,8 @@ static void request_control_terminate(xmlTextReaderPtr reader,
 			enumerator_t *enumerator;
 			ike_sa_t *ike_sa;
 
-			enumerator = charon->controller->create_ike_sa_enumerator(charon->controller);
+			enumerator = charon->controller->create_ike_sa_enumerator(
+													charon->controller, TRUE);
 			while (enumerator->enumerate(enumerator, &ike_sa))
 			{
 				if (streq(str, ike_sa->get_name(ike_sa)))
@@ -419,14 +415,14 @@ static void request_control_terminate(xmlTextReaderPtr reader,
 		if (ike)
 		{
 			status = charon->controller->terminate_ike(
-					charon->controller,	id,
-					(controller_cb_t)xml_callback, writer);
+					charon->controller, id,
+					(controller_cb_t)xml_callback, writer, 0);
 		}
 		else
 		{
 			status = charon->controller->terminate_child(
-					charon->controller,	id,
-					(controller_cb_t)xml_callback, writer);
+					charon->controller, id,
+					(controller_cb_t)xml_callback, writer, 0);
 		}
 		/* </log> */
 		xmlTextWriterEndElement(writer);
@@ -459,17 +455,21 @@ static void request_control_initiate(xmlTextReaderPtr reader,
 
 		/* <log> */
 		xmlTextWriterStartElement(writer, "log");
-		peer = charon->backends->get_peer_cfg_by_name(charon->backends, (char*)str);
+		peer = charon->backends->get_peer_cfg_by_name(charon->backends,
+													  (char*)str);
 		if (peer)
 		{
 			enumerator = peer->create_child_cfg_enumerator(peer);
 			if (ike)
 			{
-				if (!enumerator->enumerate(enumerator, &child))
+				if (enumerator->enumerate(enumerator, &child))
+				{
+					child->get_ref(child);
+				}
+				else
 				{
 					child = NULL;
 				}
-				child->get_ref(child);
 			}
 			else
 			{
@@ -488,7 +488,7 @@ static void request_control_initiate(xmlTextReaderPtr reader,
 			{
 				status = charon->controller->initiate(charon->controller,
 							peer, child, (controller_cb_t)xml_callback,
-							writer);
+							writer, 0);
 			}
 			else
 			{
@@ -625,7 +625,7 @@ static job_requeue_t process(int *fdp)
 	int fd = *fdp;
 	bool oldstate;
 	char buffer[4096];
-	size_t len;
+	ssize_t len;
 	xmlTextReaderPtr reader;
 	char *id = NULL, *type = NULL;
 
@@ -640,7 +640,7 @@ static job_requeue_t process(int *fdp)
 		DBG2(DBG_CFG, "SMP XML connection closed");
 		return JOB_REQUEUE_NONE;
 	}
-	DBG3(DBG_CFG, "got XML request: %b", buffer, len);
+	DBG3(DBG_CFG, "got XML request: %b", buffer, (u_int)len);
 
 	reader = xmlReaderForMemory(buffer, len, NULL, NULL, 0);
 	if (reader == NULL)
@@ -701,7 +701,8 @@ static job_requeue_t dispatch(private_smp_t *this)
 
 	fdp = malloc_thing(int);
 	*fdp = fd;
-	job = callback_job_create((callback_job_cb_t)process, fdp, free, this->job);
+	job = callback_job_create((callback_job_cb_t)process, fdp, free,
+							  (callback_job_cancel_t)return_false);
 	lib->processor->queue_job(lib->processor, (job_t*)job);
 
 	return JOB_REQUEUE_DIRECT;
@@ -713,10 +714,20 @@ METHOD(plugin_t, get_name, char*,
 	return "smp";
 }
 
+METHOD(plugin_t, get_features, int,
+	private_smp_t *this, plugin_feature_t *features[])
+{
+	static plugin_feature_t f[] = {
+		PLUGIN_NOOP,
+			PLUGIN_PROVIDE(CUSTOM, "smp"),
+	};
+	*features = f;
+	return countof(f);
+}
+
 METHOD(plugin_t, destroy, void,
 	private_smp_t *this)
 {
-	this->job->cancel(this->job);
 	close(this->socket);
 	free(this);
 }
@@ -730,11 +741,17 @@ plugin_t *smp_plugin_create()
 	private_smp_t *this;
 	mode_t old;
 
+	if (!lib->caps->check(lib->caps, CAP_CHOWN))
+	{	/* required to chown(2) control socket */
+		DBG1(DBG_CFG, "smp plugin requires CAP_CHOWN capability");
+		return NULL;
+	}
+
 	INIT(this,
 		.public = {
 			.plugin = {
 				.get_name = _get_name,
-				.reload = (void*)return_false,
+				.get_features = _get_features,
 				.destroy = _destroy,
 			},
 		},
@@ -750,7 +767,7 @@ plugin_t *smp_plugin_create()
 	}
 
 	unlink(unix_addr.sun_path);
-	old = umask(~(S_IRWXU | S_IRWXG));
+	old = umask(S_IRWXO);
 	if (bind(this->socket, (struct sockaddr *)&unix_addr, sizeof(unix_addr)) < 0)
 	{
 		DBG1(DBG_CFG, "could not bind XML socket: %s", strerror(errno));
@@ -759,7 +776,8 @@ plugin_t *smp_plugin_create()
 		return NULL;
 	}
 	umask(old);
-	if (chown(unix_addr.sun_path, charon->uid, charon->gid) != 0)
+	if (chown(unix_addr.sun_path, lib->caps->get_uid(lib->caps),
+			  lib->caps->get_gid(lib->caps)) != 0)
 	{
 		DBG1(DBG_CFG, "changing XML socket permissions failed: %s", strerror(errno));
 	}
@@ -772,9 +790,9 @@ plugin_t *smp_plugin_create()
 		return NULL;
 	}
 
-	this->job = callback_job_create((callback_job_cb_t)dispatch, this, NULL, NULL);
-	lib->processor->queue_job(lib->processor, (job_t*)this->job);
+	lib->processor->queue_job(lib->processor,
+		(job_t*)callback_job_create_with_prio((callback_job_cb_t)dispatch, this,
+				NULL, (callback_job_cancel_t)return_false, JOB_PRIO_CRITICAL));
 
 	return &this->public.plugin;
 }
-

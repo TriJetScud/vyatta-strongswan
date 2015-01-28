@@ -18,11 +18,14 @@
 
 #include "tls.h"
 
-#include <debug.h>
+#include <utils/debug.h>
 #include <library.h>
 
-/** Size limit for a single TLS message */
-#define MAX_TLS_MESSAGE_LEN 65536
+/**
+ * Size limit for a TLS message allowing for worst-case protection overhead
+ * according to section 6.2.3. "Payload Protection" of RFC 5246 TLS 1.2
+ */
+#define TLS_MAX_MESSAGE_LEN		4 * (TLS_MAX_FRAGMENT_LEN + 2048)
 
 typedef struct private_tls_eap_t private_tls_eap_t;
 
@@ -44,7 +47,7 @@ struct private_tls_eap_t {
 	/**
 	 * Current value of EAP identifier
 	 */
-	u_int8_t identifier;
+	uint8_t identifier;
 
 	/**
 	 * TLS stack
@@ -55,6 +58,11 @@ struct private_tls_eap_t {
 	 * Role
 	 */
 	bool is_server;
+
+	/**
+	 * Supported version of the EAP tunnel protocol
+	 */
+	uint8_t supported_version;
 
 	/**
 	 * If FALSE include the total length of an EAP message
@@ -79,7 +87,7 @@ struct private_tls_eap_t {
 	int processed;
 
 	/**
-	 * Maximum number of processed EAP messages/fragments 
+	 * Maximum number of processed EAP messages/fragments
 	 */
 	int max_msg_count;
 };
@@ -91,22 +99,24 @@ typedef enum {
 	EAP_TLS_LENGTH = (1<<7),		/* shared with EAP-TTLS/TNC/PEAP */
 	EAP_TLS_MORE_FRAGS = (1<<6),	/* shared with EAP-TTLS/TNC/PEAP */
 	EAP_TLS_START = (1<<5),			/* shared with EAP-TTLS/TNC/PEAP */
-	EAP_TTLS_VERSION = (0x07),		/* shared with EAP-TNC/PEAP      */
+	EAP_TTLS_VERSION = (0x07),		/* shared with EAP-TNC/PEAP/PT-EAP */
+	EAP_PT_START = (1<<7)			/* PT-EAP only */
 } eap_tls_flags_t;
 
-#define EAP_TTLS_SUPPORTED_VERSION	0
-#define EAP_TNC_SUPPORTED_VERSION	1
-#define EAP_PEAP_SUPPORTED_VERSION	0
+#define EAP_TTLS_SUPPORTED_VERSION		0
+#define EAP_TNC_SUPPORTED_VERSION		1
+#define EAP_PEAP_SUPPORTED_VERSION		0
+#define EAP_PT_EAP_SUPPORTED_VERSION	1
 
 /**
  * EAP-TLS/TTLS packet format
  */
 typedef struct __attribute__((packed)) {
-	u_int8_t code;
-	u_int8_t identifier;
-	u_int16_t length;
-	u_int8_t type;
-	u_int8_t flags;
+	uint8_t code;
+	uint8_t identifier;
+	uint16_t length;
+	uint8_t type;
+	uint8_t flags;
 } eap_tls_packet_t;
 
 METHOD(tls_eap_t, initiate, status_t,
@@ -117,18 +127,18 @@ METHOD(tls_eap_t, initiate, status_t,
 		eap_tls_packet_t pkt = {
 			.type = this->type,
 			.code = EAP_REQUEST,
-			.flags = EAP_TLS_START,
+			.flags = this->supported_version
 		};
 		switch (this->type)
 		{
+			case EAP_TLS:
 			case EAP_TTLS:
-				pkt.flags |= EAP_TTLS_SUPPORTED_VERSION;
-				break;
 			case EAP_TNC:
-				pkt.flags |= EAP_TNC_SUPPORTED_VERSION;
-				break;
 			case EAP_PEAP:
-				pkt.flags |= EAP_PEAP_SUPPORTED_VERSION;
+				pkt.flags |= EAP_TLS_START;
+				break;
+			case EAP_PT_EAP:
+				pkt.flags |= EAP_PT_START;
 				break;
 			default:
 				break;
@@ -138,7 +148,7 @@ METHOD(tls_eap_t, initiate, status_t,
 
 		*out = chunk_clone(chunk_from_thing(pkt));
 		DBG2(DBG_TLS, "sending %N start packet (%u bytes)",
-					   eap_type_names, this->type, sizeof(eap_tls_packet_t));
+			 eap_type_names, this->type, sizeof(eap_tls_packet_t));
 		DBG3(DBG_TLS, "%B", out);
 		return NEED_MORE;
 	}
@@ -150,11 +160,25 @@ METHOD(tls_eap_t, initiate, status_t,
  */
 static status_t process_pkt(private_tls_eap_t *this, eap_tls_packet_t *pkt)
 {
-	u_int32_t msg_len;
-	u_int16_t pkt_len;
+	uint8_t version;
+	uint16_t pkt_len;
+	uint32_t msg_len;
+	size_t msg_len_offset = 0;
 
+	/* EAP-TLS doesn't have a version field */
+	if (this->type != EAP_TLS)
+	{
+		version = pkt->flags & EAP_TTLS_VERSION;
+		if (version != this->supported_version)
+		{
+			DBG1(DBG_TLS, "received %N packet with unsupported version v%u",
+			eap_type_names, this->type, version);
+			return FAILED;
+		}
+	}
 	pkt_len = untoh16(&pkt->length);
-	if (pkt->flags & EAP_TLS_LENGTH)
+
+	if (this->type != EAP_PT_EAP && (pkt->flags & EAP_TLS_LENGTH))
 	{
 		if (pkt_len < sizeof(eap_tls_packet_t) + sizeof(msg_len))
 		{
@@ -163,16 +187,17 @@ static status_t process_pkt(private_tls_eap_t *this, eap_tls_packet_t *pkt)
 		}
 		msg_len = untoh32(pkt + 1);
 		if (msg_len < pkt_len - sizeof(eap_tls_packet_t) - sizeof(msg_len) ||
-			msg_len > MAX_TLS_MESSAGE_LEN)
+			msg_len > TLS_MAX_MESSAGE_LEN)
 		{
-			DBG1(DBG_TLS, "invalid %N packet length", eap_type_names, this->type);
+			DBG1(DBG_TLS, "invalid %N packet length (%u bytes)", eap_type_names,
+				 this->type, msg_len);
 			return FAILED;
 		}
-		return this->tls->process(this->tls, (char*)(pkt + 1) + sizeof(msg_len),
-						pkt_len - sizeof(eap_tls_packet_t) - sizeof(msg_len));
+		msg_len_offset = sizeof(msg_len);
 	}
-	return this->tls->process(this->tls, (char*)(pkt + 1),
-							  pkt_len - sizeof(eap_tls_packet_t));
+
+	return this->tls->process(this->tls, (char*)(pkt + 1) + msg_len_offset,
+					   pkt_len - sizeof(eap_tls_packet_t) - msg_len_offset);
 }
 
 /**
@@ -182,7 +207,7 @@ static status_t build_pkt(private_tls_eap_t *this, chunk_t *out)
 {
 	char buf[this->frag_size];
 	eap_tls_packet_t *pkt;
-	size_t len, reclen;
+	size_t len, reclen, msg_len_offset;
 	status_t status;
 	char *kind;
 
@@ -194,35 +219,21 @@ static status_t build_pkt(private_tls_eap_t *this, chunk_t *out)
 	pkt->code = this->is_server ? EAP_REQUEST : EAP_RESPONSE;
 	pkt->identifier = this->identifier;
 	pkt->type = this->type;
-	pkt->flags = 0;
-
-	switch (this->type)
-	{
-		case EAP_TTLS:
-			pkt->flags |= EAP_TTLS_SUPPORTED_VERSION;
-			break;
-		case EAP_TNC:
-			pkt->flags |= EAP_TNC_SUPPORTED_VERSION;
-			break;
-		case EAP_PEAP:
-			pkt->flags |= EAP_PEAP_SUPPORTED_VERSION;
-			break;
-		default:
-			break;
-	}
+	pkt->flags = this->supported_version;
 
 	if (this->first_fragment)
 	{
-		len = sizeof(buf) - sizeof(eap_tls_packet_t) - sizeof(u_int32_t);
-		status = this->tls->build(this->tls, buf + sizeof(eap_tls_packet_t) +
-								  sizeof(u_int32_t), &len, &reclen);
+		len = sizeof(buf) - sizeof(eap_tls_packet_t) - sizeof(uint32_t);
+		msg_len_offset = sizeof(uint32_t);
 	}
 	else
 	{
 		len = sizeof(buf) - sizeof(eap_tls_packet_t);
-		status = this->tls->build(this->tls, buf + sizeof(eap_tls_packet_t),
-								  &len, &reclen);
+		msg_len_offset = 0;
 	}
+	status = this->tls->build(this->tls, buf + sizeof(eap_tls_packet_t) +
+										 msg_len_offset, &len, &reclen);
+
 	switch (status)
 	{
 		case NEED_MORE:
@@ -230,7 +241,7 @@ static status_t build_pkt(private_tls_eap_t *this, chunk_t *out)
 			kind = "further fragment";
 			if (this->first_fragment)
 			{
-		        pkt->flags |= EAP_TLS_LENGTH;
+				pkt->flags |= EAP_TLS_LENGTH;
 				this->first_fragment = FALSE;
 				kind = "first fragment";
 			}
@@ -244,10 +255,14 @@ static status_t build_pkt(private_tls_eap_t *this, chunk_t *out)
 				}
 				kind = "packet";
 			}
-			else
+			else if (this->type != EAP_TNC && this->type != EAP_PT_EAP)
 			{
 				this->first_fragment = TRUE;
 				kind = "final fragment";
+			}
+			else
+			{
+				kind = "packet";
 			}
 			break;
 		default:
@@ -256,23 +271,23 @@ static status_t build_pkt(private_tls_eap_t *this, chunk_t *out)
 	if (reclen)
 	{
 		if (pkt->flags & EAP_TLS_LENGTH)
-		{ 
+		{
 			htoun32(pkt + 1, reclen);
-			len += sizeof(u_int32_t);
+			len += sizeof(uint32_t);
 			pkt->flags |= EAP_TLS_LENGTH;
 		}
 		else
 		{
 			/* get rid of the reserved length field */
-			memcpy(buf+sizeof(eap_packet_t),
-				   buf+sizeof(eap_packet_t)+sizeof(u_int32_t), len);	
+			memmove(buf + sizeof(eap_tls_packet_t),
+					buf + sizeof(eap_tls_packet_t) + sizeof(uint32_t), len);
 		}
 	}
 	len += sizeof(eap_tls_packet_t);
 	htoun16(&pkt->length, len);
 	*out = chunk_clone(chunk_create(buf, len));
 	DBG2(DBG_TLS, "sending %N %s (%u bytes)",
-				   eap_type_names, this->type, kind, len);
+		 eap_type_names, this->type, kind, len);
 	DBG3(DBG_TLS, "%B", out);
 	return NEED_MORE;
 }
@@ -319,7 +334,7 @@ METHOD(tls_eap_t, process, status_t,
 	eap_tls_packet_t *pkt;
 	status_t status;
 
-	if (++this->processed > this->max_msg_count)
+	if (this->max_msg_count && ++this->processed > this->max_msg_count)
 	{
 		DBG1(DBG_TLS, "%N packet count exceeded (%d > %d)",
 			 eap_type_names, this->type,
@@ -341,10 +356,11 @@ METHOD(tls_eap_t, process, status_t,
 	}
 	DBG3(DBG_TLS, "%N payload %B", eap_type_names, this->type, &in);
 
-	if (pkt->flags & EAP_TLS_START)
+	if ((this->type == EAP_PT_EAP && (pkt->flags & EAP_PT_START)) ||
+        (pkt->flags & EAP_TLS_START))
 	{
 		if (this->type == EAP_TTLS || this->type == EAP_TNC ||
-			this->type == EAP_PEAP)
+			this->type == EAP_PEAP || this->type == EAP_PT_EAP)
 		{
 			DBG1(DBG_TLS, "%N version is v%u", eap_type_names, this->type,
 				 pkt->flags & EAP_TTLS_VERSION);
@@ -398,14 +414,14 @@ METHOD(tls_eap_t, get_msk, chunk_t,
 	return this->tls->get_eap_msk(this->tls);
 }
 
-METHOD(tls_eap_t, get_identifier, u_int8_t,
+METHOD(tls_eap_t, get_identifier, uint8_t,
 	private_tls_eap_t *this)
 {
 	return this->identifier;
 }
 
 METHOD(tls_eap_t, set_identifier, void,
-	private_tls_eap_t *this, u_int8_t identifier)
+	private_tls_eap_t *this, uint8_t identifier)
 {
 	this->identifier = identifier;
 }
@@ -441,12 +457,30 @@ tls_eap_t *tls_eap_create(eap_type_t type, tls_t *tls, size_t frag_size,
 		},
 		.type = type,
 		.is_server = tls->is_server(tls),
-		.first_fragment = TRUE,
+		.first_fragment = (type != EAP_TNC && type != EAP_PT_EAP),
 		.frag_size = frag_size,
 		.max_msg_count = max_msg_count,
 		.include_length = include_length,
 		.tls = tls,
 	);
+
+	switch (type)
+	{
+		case EAP_TTLS:
+			this->supported_version = EAP_TTLS_SUPPORTED_VERSION;
+			break;
+		case EAP_TNC:
+			this->supported_version = EAP_TNC_SUPPORTED_VERSION;
+			break;
+		case EAP_PEAP:
+			this->supported_version = EAP_PEAP_SUPPORTED_VERSION;
+			break;
+		case EAP_PT_EAP:
+			this->supported_version = EAP_PT_EAP_SUPPORTED_VERSION;
+			break;
+		default:
+			break;
+	}
 
 	if (this->is_server)
 	{

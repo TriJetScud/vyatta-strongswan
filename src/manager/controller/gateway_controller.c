@@ -39,7 +39,7 @@ struct private_gateway_controller_t {
 
 };
 
-static void list(private_gateway_controller_t *this, request_t *request)
+static void list(private_gateway_controller_t *this, fast_request_t *request)
 {
 	enumerator_t *enumerator;
 	char *name, *address;
@@ -66,7 +66,7 @@ static void list(private_gateway_controller_t *this, request_t *request)
 	request->render(request, "templates/gateway/list.cs");
 }
 
-static void _select(private_gateway_controller_t *this, request_t *request)
+static void _select(private_gateway_controller_t *this, fast_request_t *request)
 {
 	char *id;
 
@@ -82,19 +82,15 @@ static void _select(private_gateway_controller_t *this, request_t *request)
 	request->redirect(request, "gateway/list");
 }
 
-/**
- * Implementation of controller_t.get_name
- */
-static char* get_name(private_gateway_controller_t *this)
+METHOD(fast_controller_t, get_name, char*,
+	private_gateway_controller_t *this)
 {
 	return "gateway";
 }
 
-/**
- * Implementation of controller_t.handle
- */
-static void handle(private_gateway_controller_t *this,
-				   request_t *request, char *action)
+METHOD(fast_controller_t, handle, void,
+	private_gateway_controller_t *this, fast_request_t *request, char *action,
+	char *p2, char *p3, char *p4, char *p5)
 {
 	if (!this->manager->logged_in(this->manager))
 	{
@@ -114,11 +110,8 @@ static void handle(private_gateway_controller_t *this,
 	request->redirect(request, "gateway/list");
 }
 
-
-/**
- * Implementation of controller_t.destroy
- */
-static void destroy(private_gateway_controller_t *this)
+METHOD(fast_controller_t, destroy, void,
+	private_gateway_controller_t *this)
 {
 	free(this);
 }
@@ -126,16 +119,21 @@ static void destroy(private_gateway_controller_t *this)
 /*
  * see header file
  */
-controller_t *gateway_controller_create(context_t *context, void *param)
+fast_controller_t *gateway_controller_create(fast_context_t *context,
+											 void *param)
 {
-	private_gateway_controller_t *this = malloc_thing(private_gateway_controller_t);
+	private_gateway_controller_t *this;
 
-	this->public.controller.get_name = (char*(*)(controller_t*))get_name;
-	this->public.controller.handle = (void(*)(controller_t*,request_t*,char*,char*,char*,char*,char*))handle;
-	this->public.controller.destroy = (void(*)(controller_t*))destroy;
-
-	this->manager = (manager_t*)context;
+	INIT(this,
+		.public = {
+			.controller = {
+				.get_name = _get_name,
+				.handle = _handle,
+				.destroy = _destroy,
+			},
+		},
+		.manager = (manager_t*)context,
+	);
 
 	return &this->public.controller;
 }
-

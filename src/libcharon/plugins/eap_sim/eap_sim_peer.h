@@ -21,15 +21,12 @@
 #ifndef EAP_SIM_PEER_H_
 #define EAP_SIM_PEER_H_
 
-#include <sa/authenticators/eap/eap_method.h>
+#include <sa/eap/eap_method.h>
 
 typedef struct eap_sim_peer_t eap_sim_peer_t;
 
 /**
  * EAP-SIM peer implementation.
- *
- * This EAP-SIM module uses sim_card_t implementations for triplet calculation,
- * found via the eap_sim_manager_t.
  */
 struct eap_sim_peer_t {
 

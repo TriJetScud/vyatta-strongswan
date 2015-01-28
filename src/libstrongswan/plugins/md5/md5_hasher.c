@@ -299,54 +299,8 @@ static void MD5Final (private_md5_hasher_t *this, u_int8_t digest[16])
 	}
 }
 
-
-
-/**
- * Implementation of hasher_t.get_hash.
- */
-static void get_hash(private_md5_hasher_t *this, chunk_t chunk, u_int8_t *buffer)
-{
-	MD5Update(this, chunk.ptr, chunk.len);
-	if (buffer != NULL)
-	{
-		MD5Final(this, buffer);
-		this->public.hasher_interface.reset(&(this->public.hasher_interface));
-	}
-}
-
-
-/**
- * Implementation of hasher_t.allocate_hash.
- */
-static void allocate_hash(private_md5_hasher_t *this, chunk_t chunk, chunk_t *hash)
-{
-	chunk_t allocated_hash;
-
-	MD5Update(this, chunk.ptr, chunk.len);
-	if (hash != NULL)
-	{
-		allocated_hash.ptr = malloc(HASH_SIZE_MD5);
-		allocated_hash.len = HASH_SIZE_MD5;
-
-		MD5Final(this, allocated_hash.ptr);
-		this->public.hasher_interface.reset(&(this->public.hasher_interface));
-
-		*hash = allocated_hash;
-	}
-}
-
-/**
- * Implementation of hasher_t.get_hash_size.
- */
-static size_t get_hash_size(private_md5_hasher_t *this)
-{
-	return HASH_SIZE_MD5;
-}
-
-/**
- * Implementation of hasher_t.reset.
- */
-static void reset(private_md5_hasher_t *this)
+METHOD(hasher_t, reset, bool,
+	private_md5_hasher_t *this)
 {
 	this->state[0] = 0x67452301;
 	this->state[1] = 0xefcdab89;
@@ -354,12 +308,43 @@ static void reset(private_md5_hasher_t *this)
 	this->state[3] = 0x10325476;
 	this->count[0] = 0;
 	this->count[1] = 0;
+
+	return TRUE;
 }
 
-/**
- * Implementation of hasher_t.destroy.
- */
-static void destroy(private_md5_hasher_t *this)
+METHOD(hasher_t, get_hash, bool,
+	private_md5_hasher_t *this, chunk_t chunk, u_int8_t *buffer)
+{
+	MD5Update(this, chunk.ptr, chunk.len);
+	if (buffer != NULL)
+	{
+		MD5Final(this, buffer);
+		reset(this);
+	}
+	return TRUE;
+}
+
+METHOD(hasher_t, allocate_hash, bool,
+	private_md5_hasher_t *this, chunk_t chunk, chunk_t *hash)
+{
+	MD5Update(this, chunk.ptr, chunk.len);
+	if (hash != NULL)
+	{
+		*hash = chunk_alloc(HASH_SIZE_MD5);
+		MD5Final(this, hash->ptr);
+		reset(this);
+	}
+	return TRUE;
+}
+
+METHOD(hasher_t, get_hash_size, size_t,
+	private_md5_hasher_t *this)
+{
+	return HASH_SIZE_MD5;
+}
+
+METHOD(hasher_t, destroy, void,
+	private_md5_hasher_t *this)
 {
 	free(this);
 }
@@ -375,13 +360,18 @@ md5_hasher_t *md5_hasher_create(hash_algorithm_t algo)
 	{
 		return NULL;
 	}
-	this = malloc_thing(private_md5_hasher_t);
 
-	this->public.hasher_interface.get_hash = (void (*) (hasher_t*, chunk_t, u_int8_t*))get_hash;
-	this->public.hasher_interface.allocate_hash = (void (*) (hasher_t*, chunk_t, chunk_t*))allocate_hash;
-	this->public.hasher_interface.get_hash_size = (size_t (*) (hasher_t*))get_hash_size;
-	this->public.hasher_interface.reset = (void (*) (hasher_t*))reset;
-	this->public.hasher_interface.destroy = (void (*) (hasher_t*))destroy;
+	INIT(this,
+		.public = {
+			.hasher_interface = {
+				.get_hash = _get_hash,
+				.allocate_hash = _allocate_hash,
+				.get_hash_size = _get_hash_size,
+				.reset = _reset,
+				.destroy = _destroy,
+			},
+		},
+	);
 
 	/* initialize */
 	reset(this);

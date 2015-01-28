@@ -46,12 +46,13 @@ ENUM_NEXT(encryption_algorithm_names, ENCR_CAMELLIA_CBC, ENCR_CAMELLIA_CCM_ICV16
 	"CAMELLIA_CCM_8",
 	"CAMELLIA_CCM_12",
 	"CAMELLIA_CCM_16");
-ENUM_NEXT(encryption_algorithm_names, ENCR_UNDEFINED, ENCR_TWOFISH_CBC, ENCR_CAMELLIA_CCM_ICV16,
+ENUM_NEXT(encryption_algorithm_names, ENCR_UNDEFINED, ENCR_RC2_CBC, ENCR_CAMELLIA_CCM_ICV16,
 	"UNDEFINED",
 	"DES_ECB",
 	"SERPENT_CBC",
-	"TWOFISH_CBC");
-ENUM_END(encryption_algorithm_names, ENCR_TWOFISH_CBC);
+	"TWOFISH_CBC",
+	"RC2_CBC");
+ENUM_END(encryption_algorithm_names, ENCR_RC2_CBC);
 
 /*
  * Described in header.
@@ -94,6 +95,10 @@ encryption_algorithm_t encryption_algorithm_from_oid(int oid, size_t *key_size)
 		case OID_CAMELLIA256_CBC:
 			alg = ENCR_CAMELLIA_CBC;
 			alg_key_size = 256;
+			break;
+		case OID_BLOWFISH_CBC:
+			alg = ENCR_BLOWFISH;
+			alg_key_size = 0;
 			break;
 		default:
 			alg = ENCR_UNDEFINED;
@@ -152,6 +157,9 @@ int encryption_algorithm_to_oid(encryption_algorithm_t alg, size_t key_size)
 				default:
 					oid = OID_UNKNOWN;
 			}
+			break;
+		case ENCR_BLOWFISH:
+			oid = OID_BLOWFISH_CBC;
 			break;
 		default:
 			oid = OID_UNKNOWN;

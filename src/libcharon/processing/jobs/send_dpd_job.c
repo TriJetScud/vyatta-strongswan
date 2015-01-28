@@ -45,7 +45,7 @@ METHOD(job_t, destroy, void,
 	free(this);
 }
 
-METHOD(job_t, execute, void,
+METHOD(job_t, execute, job_requeue_t,
 	private_send_dpd_job_t *this)
 {
 	ike_sa_t *ike_sa;
@@ -63,7 +63,13 @@ METHOD(job_t, execute, void,
 			charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa);
 		}
 	}
-	destroy(this);
+	return JOB_REQUEUE_NONE;
+}
+
+METHOD(job_t, get_priority, job_priority_t,
+	private_send_dpd_job_t *this)
+{
+	return JOB_PRIO_HIGH;
 }
 
 /*
@@ -77,6 +83,7 @@ send_dpd_job_t *send_dpd_job_create(ike_sa_id_t *ike_sa_id)
 		.public = {
 			.job_interface = {
 				.execute = _execute,
+				.get_priority = _get_priority,
 				.destroy = _destroy,
 			},
 		},

@@ -29,8 +29,8 @@ typedef struct identification_t identification_t;
 typedef enum id_match_t id_match_t;
 typedef enum id_part_t id_part_t;
 
-#include <chunk.h>
-#include <utils/enumerator.h>
+#include <utils/chunk.h>
+#include <collections/enumerator.h>
 
 /**
  * Matches returned from identification_t.match
@@ -126,14 +126,14 @@ enum id_type_t {
 	ID_KEY_ID = 11,
 
 	/**
-	 * private type which represents a GeneralName of type URI
+	 * Private ID type which represents a GeneralName of type URI
 	 */
 	ID_DER_ASN1_GN_URI = 201,
 
 	/**
-	 * Private ID used by the pluto daemon for opportunistic encryption
+	 * Private ID type which represents a user ID
 	 */
-	ID_MYID = 203,
+	ID_USER_ID = 202
 };
 
 /**
@@ -171,6 +171,8 @@ enum id_part_t {
 	ID_PART_RDN_G,
 	/** Initials RDN of a DN */
 	ID_PART_RDN_I,
+	/** DN Qualifier RDN of a DN */
+	ID_PART_RDN_DNQ,
 	/** UniqueIdentifier RDN of a DN */
 	ID_PART_RDN_ID,
 	/** Locality RDN of a DN */
@@ -239,7 +241,6 @@ struct identification_t {
 	 * no match at all, 1 means a bad match, and 2 a slightly better match.
 	 *
 	 * @param other		the ID containing one or more wildcards
-	 * @param wildcards	returns the number of wildcards, may be NULL
 	 * @return 			match value as described above
 	 */
 	id_match_t (*matches) (identification_t *this, identification_t *other);
@@ -293,13 +294,22 @@ struct identification_t {
  *
  * In favour of pluto, domainnames are prepended with an @, since
  * pluto resolves domainnames without an @ to IPv4 addresses. Since
- * we use a seperate host_t class for addresses, this doesn't
+ * we use a separate host_t class for addresses, this doesn't
  * make sense for us.
  *
  * A distinguished name may contain one or more of the following RDNs:
  * ND, UID, DC, CN, S, SN, serialNumber, C, L, ST, O, OU, T, D,
- * N, G, I, ID, EN, EmployeeNumber, E, Email, emailAddress, UN,
+ * N, G, I, dnQualifier, ID, EN, EmployeeNumber, E, Email, emailAddress, UN,
  * unstructuredName, TCGID.
+ *
+ * To skip automatic type detection the following prefixes may be used to
+ * enforce a specific type: ipv4:, ipv6:, rfc822:, email:, userfqdn:, fqdn:,
+ * dns:, asn1dn:, asn1gn: and keyid:. If a # follows the :, the remaining data
+ * is interpreted as hex encoded binary data for that ID, otherwise the raw
+ * string following the prefix is used as identity data, without conversion.
+ * To specify a non-standard ID type, the numerical type may be prefixed
+ * between curly backets, building a prefix. For instance the "{1}:" prefix
+ * defines an ID_IPV4_ADDR type.
  *
  * This constructor never returns NULL. If it does not find a suitable
  * conversion function, it will copy the string to an ID_KEY_ID.
@@ -340,7 +350,7 @@ identification_t * identification_create_from_sockaddr(sockaddr_t *sockaddr);
  * Arguments are:
  *	identification_t *identification
  */
-int identification_printf_hook(char *dst, size_t len, printf_hook_spec_t *spec,
-							   const void *const *args);
+int identification_printf_hook(printf_hook_data_t *data,
+							printf_hook_spec_t *spec, const void *const *args);
 
 #endif /** IDENTIFICATION_H_ @}*/

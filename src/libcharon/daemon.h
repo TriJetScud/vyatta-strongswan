@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2006-2010 Tobias Brunner
+ * Copyright (C) 2006-2012 Tobias Brunner
  * Copyright (C) 2005-2009 Martin Willi
  * Copyright (C) 2006 Daniel Roethlisberger
  * Copyright (C) 2005 Jan Hutter
@@ -55,14 +55,29 @@
  * @defgroup sa sa
  * @ingroup libcharon
  *
- * @defgroup authenticators authenticators
+ * @defgroup ikev1 ikev1
  * @ingroup sa
+ *
+ * @defgroup ikev2 ikev2
+ * @ingroup sa
+ *
+ * @defgroup authenticators_v1 authenticators
+ * @ingroup ikev1
+ *
+ * @defgroup authenticators_v2 authenticators
+ * @ingroup ikev2
  *
  * @defgroup eap eap
- * @ingroup authenticators
- *
- * @defgroup tasks tasks
  * @ingroup sa
+ *
+ * @defgroup xauth xauth
+ * @ingroup sa
+ *
+ * @defgroup tasks_v1 tasks
+ * @ingroup ikev1
+ *
+ * @defgroup tasks_v2 tasks
+ * @ingroup ikev2
  *
  * @addtogroup libcharon
  * @{
@@ -142,20 +157,16 @@ typedef struct daemon_t daemon_t;
 #include <network/socket_manager.h>
 #include <control/controller.h>
 #include <bus/bus.h>
-#include <bus/listeners/file_logger.h>
-#include <bus/listeners/sys_logger.h>
 #include <sa/ike_sa_manager.h>
 #include <sa/trap_manager.h>
+#include <sa/shunt_manager.h>
 #include <config/backend_manager.h>
-#include <sa/authenticators/eap/eap_manager.h>
-#include <sa/authenticators/eap/sim_manager.h>
-#include <tnc/imc/imc_manager.h>
-#include <tnc/imv/imv_manager.h>
-#include <tnc/tnccs/tnccs_manager.h>
+#include <sa/eap/eap_manager.h>
+#include <sa/xauth/xauth_manager.h>
 
 #ifdef ME
-#include <sa/connect_manager.h>
-#include <sa/mediation_manager.h>
+#include <sa/ikev2/connect_manager.h>
+#include <sa/ikev2/mediation_manager.h>
 #endif /* ME */
 
 /**
@@ -164,14 +175,29 @@ typedef struct daemon_t daemon_t;
 #define DEFAULT_THREADS 16
 
 /**
- * UDP Port on which the daemon will listen for incoming traffic.
+ * Primary UDP port used by IKE.
  */
 #define IKEV2_UDP_PORT 500
 
 /**
- * UDP Port to which the daemon will float to if NAT is detected.
+ * UDP port defined for use in case a NAT is detected.
  */
 #define IKEV2_NATT_PORT 4500
+
+/**
+ * UDP port on which the daemon will listen for incoming traffic (also used as
+ * source port for outgoing traffic).
+ */
+#ifndef CHARON_UDP_PORT
+#define CHARON_UDP_PORT IKEV2_UDP_PORT
+#endif
+
+/**
+ * UDP port used by the daemon in case a NAT is detected.
+ */
+#ifndef CHARON_NATT_PORT
+#define CHARON_NATT_PORT IKEV2_NATT_PORT
+#endif
 
 /**
  * Main class of daemon, contains some globals.
@@ -194,6 +220,11 @@ struct daemon_t {
 	trap_manager_t *traps;
 
 	/**
+	 * Manager for shunt PASS|DROP policies
+	 */
+	shunt_manager_t *shunts;
+
+	/**
 	 * Manager for the different configuration backends.
 	 */
 	backend_manager_t *backends;
@@ -214,16 +245,6 @@ struct daemon_t {
 	bus_t *bus;
 
 	/**
-	 * A list of installed file_logger_t's
-	 */
-	linked_list_t *file_loggers;
-
-	/**
-	 * A list of installed sys_logger_t's
-	 */
-	linked_list_t *sys_loggers;
-
-	/**
 	 * Controller to control the daemon
 	 */
 	controller_t *controller;
@@ -234,24 +255,9 @@ struct daemon_t {
 	eap_manager_t *eap;
 
 	/**
-	 * SIM manager to maintain (U)SIM cards/providers
+	 * XAuth manager to maintain registered XAuth methods
 	 */
-	sim_manager_t *sim;
-
-	/**
-	 * TNC IMC manager controlling Integrity Measurement Collectors
-	 */
-	imc_manager_t *imcs;
-
-	/**
-	 * TNC IMV manager controlling Integrity Measurement Verifiers
-	 */
-	imv_manager_t *imvs;
-
-	/**
-	 * TNCCS manager to maintain registered TNCCS protocols
-	 */
-	tnccs_manager_t *tnccs;
+	xauth_manager_t *xauth;
 
 #ifdef ME
 	/**
@@ -266,45 +272,37 @@ struct daemon_t {
 #endif /* ME */
 
 	/**
-	 * User ID the daemon will user after initialization
-	 */
-	uid_t uid;
-
-	/**
-	 * Group ID the daemon will use after initialization
-	 */
-	gid_t gid;
-
-	/**
-	 * Do not drop a given capability after initialization.
-	 *
-	 * Some plugins might need additional capabilites. They tell the daemon
-	 * during plugin initialization which one they need, the daemon won't
-	 * drop these.
-	 */
-	void (*keep_cap)(daemon_t *this, u_int cap);
-
-	/**
-	 * Drop all capabilities of the current process.
-	 *
-	 * Drops all capabalities, excect those exlcuded using keep_cap().
-	 * This should be called after the initialization of the daemon because
-	 * some plugins require the process to keep additional capabilities.
-	 *
-	 * @return		TRUE if successful, FALSE otherwise
-	 */
-	bool (*drop_capabilities)(daemon_t *this);
-
-	/**
 	 * Initialize the daemon.
+	 *
+	 * @param plugins	list of plugins to load
+	 * @return			TRUE, if successful
 	 */
-	bool (*initialize)(daemon_t *this);
+	bool (*initialize)(daemon_t *this, char *plugins);
 
 	/**
 	 * Starts the daemon, i.e. spawns the threads of the thread pool.
 	 */
 	void (*start)(daemon_t *this);
 
+	/**
+	 * Load/Reload loggers defined in strongswan.conf
+	 *
+	 * @param levels	optional debug levels used to create default loggers
+	 * 					if none are defined in strongswan.conf
+	 * @param to_stderr	TRUE to log to stderr/stdout if no loggers are defined
+	 * 					in strongswan.conf
+	 */
+	void (*load_loggers)(daemon_t *this, level_t levels[DBG_MAX],
+						 bool to_stderr);
+
+	/**
+	 * Set the log level for the given log group for all configured file- and
+	 * syslog-loggers.
+	 *
+	 * @param group		log group
+	 * @param level		log level
+	 */
+	void (*set_level)(daemon_t *this, debug_t group, level_t level);
 };
 
 /**
@@ -319,6 +317,9 @@ extern daemon_t *charon;
  *
  * This function initializes the bus, listeners can be registered before
  * calling initialize().
+ *
+ * libcharon_init() may be called multiple times in a single process, but each
+ * caller must call libcharon_deinit() for each call to libcharon_init().
  *
  * @return		FALSE if integrity check failed
  */

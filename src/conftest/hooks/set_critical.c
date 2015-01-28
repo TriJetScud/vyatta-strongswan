@@ -47,9 +47,9 @@ struct private_set_critical_t {
 
 METHOD(listener_t, message, bool,
 	private_set_critical_t *this, ike_sa_t *ike_sa, message_t *message,
-	bool incoming)
+	bool incoming, bool plain)
 {
-	if (!incoming &&
+	if (!incoming && plain &&
 		message->get_request(message) == this->req &&
 		message->get_message_id(message) == this->id)
 	{
@@ -65,8 +65,7 @@ METHOD(listener_t, message, bool,
 			type = atoi(name);
 			if (!type)
 			{
-				type = enum_from_name(payload_type_short_names, name);
-				if (type == -1)
+				if (!enum_from_name(payload_type_short_names, name, &type))
 				{
 					DBG1(DBG_CFG, "invalid payload name '%s'", name);
 					break;

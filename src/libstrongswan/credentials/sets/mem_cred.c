@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010 Tobias Brunner
+ * Copyright (C) 2010-2013 Tobias Brunner
  * Hochschule fuer Technik Rapperwsil
  * Copyright (C) 2010 Martin Willi
  * Copyright (C) 2010 revosec AG
@@ -18,7 +18,7 @@
 #include "mem_cred.h"
 
 #include <threading/rwlock.h>
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 
 typedef struct private_mem_cred_t private_mem_cred_t;
 
@@ -307,8 +307,25 @@ METHOD(credential_set_t, create_private_enumerator, enumerator_t*,
 METHOD(mem_cred_t, add_key, void,
 	private_mem_cred_t *this, private_key_t *key)
 {
+	enumerator_t *enumerator;
+	private_key_t *current;
+
 	this->lock->write_lock(this->lock);
+
+	enumerator = this->keys->create_enumerator(this->keys);
+	while (enumerator->enumerate(enumerator, &current))
+	{
+		if (current->equals(current, key))
+		{
+			this->keys->remove_at(this->keys, enumerator);
+			current->destroy(current);
+			break;
+		}
+	}
+	enumerator->destroy(enumerator);
+
 	this->keys->insert_first(this->keys, key);
+
 	this->lock->unlock(this->lock);
 }
 
@@ -331,6 +348,44 @@ static void shared_entry_destroy(shared_entry_t *entry)
 								  offsetof(identification_t, destroy));
 	entry->shared->destroy(entry->shared);
 	free(entry);
+}
+
+/**
+ * Check if two shared key entries equal
+ */
+static bool shared_entry_equals(shared_entry_t *a, shared_entry_t *b)
+{
+	enumerator_t *e1, *e2;
+	identification_t *id1, *id2;
+	bool equals = TRUE;
+
+	if (a->shared->get_type(a->shared) != b->shared->get_type(b->shared))
+	{
+		return FALSE;
+	}
+	if (!chunk_equals(a->shared->get_key(a->shared),
+					  b->shared->get_key(b->shared)))
+	{
+		return FALSE;
+	}
+	if (a->owners->get_count(a->owners) != b->owners->get_count(b->owners))
+	{
+		return FALSE;
+	}
+	e1 = a->owners->create_enumerator(a->owners);
+	e2 = b->owners->create_enumerator(b->owners);
+	while (e1->enumerate(e1, &id1) && e2->enumerate(e2, &id2))
+	{
+		if (!id1->equals(id1, id2))
+		{
+			equals = FALSE;
+			break;
+		}
+	}
+	e1->destroy(e1);
+	e2->destroy(e2);
+
+	return equals;
 }
 
 /**
@@ -435,15 +490,30 @@ METHOD(credential_set_t, create_shared_enumerator, enumerator_t*,
 METHOD(mem_cred_t, add_shared_list, void,
 	private_mem_cred_t *this, shared_key_t *shared, linked_list_t* owners)
 {
-	shared_entry_t *entry;
+	shared_entry_t *current, *new;
+	enumerator_t *enumerator;
 
-	INIT(entry,
+	INIT(new,
 		.shared = shared,
 		.owners = owners,
 	);
 
 	this->lock->write_lock(this->lock);
-	this->shared->insert_first(this->shared, entry);
+
+	enumerator = this->shared->create_enumerator(this->shared);
+	while (enumerator->enumerate(enumerator, &current))
+	{
+		if (shared_entry_equals(current, new))
+		{
+			this->shared->remove_at(this->shared, enumerator);
+			shared_entry_destroy(current);
+			break;
+		}
+	}
+	enumerator->destroy(enumerator);
+
+	this->shared->insert_first(this->shared, new);
+
 	this->lock->unlock(this->lock);
 }
 
@@ -555,14 +625,66 @@ METHOD(credential_set_t, create_cdp_enumerator, enumerator_t*,
 
 }
 
-METHOD(mem_cred_t, clear_secrets, void,
-	private_mem_cred_t *this)
+static void reset_secrets(private_mem_cred_t *this)
 {
-	this->lock->write_lock(this->lock);
 	this->keys->destroy_offset(this->keys, offsetof(private_key_t, destroy));
 	this->shared->destroy_function(this->shared, (void*)shared_entry_destroy);
 	this->keys = linked_list_create();
 	this->shared = linked_list_create();
+}
+
+METHOD(mem_cred_t, replace_secrets, void,
+	private_mem_cred_t *this, mem_cred_t *other_set, bool clone)
+{
+	private_mem_cred_t *other = (private_mem_cred_t*)other_set;
+	enumerator_t *enumerator;
+	shared_entry_t *entry, *new_entry;
+	private_key_t *key;
+
+	this->lock->write_lock(this->lock);
+
+	reset_secrets(this);
+
+	if (clone)
+	{
+		enumerator = other->keys->create_enumerator(other->keys);
+		while (enumerator->enumerate(enumerator, &key))
+		{
+			this->keys->insert_last(this->keys, key->get_ref(key));
+		}
+		enumerator->destroy(enumerator);
+		enumerator = other->shared->create_enumerator(other->shared);
+		while (enumerator->enumerate(enumerator, &entry))
+		{
+			INIT(new_entry,
+				.shared = entry->shared->get_ref(entry->shared),
+				.owners = entry->owners->clone_offset(entry->owners,
+											offsetof(identification_t, clone)),
+			);
+			this->shared->insert_last(this->shared, new_entry);
+		}
+		enumerator->destroy(enumerator);
+	}
+	else
+	{
+		while (other->keys->remove_first(other->keys, (void**)&key) == SUCCESS)
+		{
+			this->keys->insert_last(this->keys, key);
+		}
+		while (other->shared->remove_first(other->shared,
+										  (void**)&entry) == SUCCESS)
+		{
+			this->shared->insert_last(this->shared, entry);
+		}
+	}
+	this->lock->unlock(this->lock);
+}
+
+METHOD(mem_cred_t, clear_secrets, void,
+	private_mem_cred_t *this)
+{
+	this->lock->write_lock(this->lock);
+	reset_secrets(this);
 	this->lock->unlock(this->lock);
 }
 
@@ -619,6 +741,7 @@ mem_cred_t *mem_cred_create()
 			.add_shared = _add_shared,
 			.add_shared_list = _add_shared_list,
 			.add_cdp = _add_cdp,
+			.replace_secrets = _replace_secrets,
 			.clear = _clear_,
 			.clear_secrets = _clear_secrets,
 			.destroy = _destroy,

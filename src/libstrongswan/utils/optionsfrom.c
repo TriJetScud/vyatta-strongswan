@@ -2,22 +2,22 @@
  * Copyright (C) 2007-2008 Andreas Steffen
  * Hochschule fuer Technik Rapperswil
  *
- * This library is free software; you can redistribute it and/or modify it
- * under the terms of the GNU Library General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or (at your
- * option) any later version.  See <http://www.fsf.org/copyleft/lgpl.txt>.
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2 of the License, or (at your
+ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
  *
- * This library is distributed in the hope that it will be useful, but
+ * This program is distributed in the hope that it will be useful, but
  * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Library General Public
- * License for more details.
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * for more details.
  */
 
 #include <stdio.h>
 #include <errno.h>
 
 #include <library.h>
-#include <debug.h>
+#include <utils/debug.h>
 #include <utils/lexparser.h>
 
 #include "optionsfrom.h"
@@ -67,7 +67,6 @@ METHOD(options_t, from, bool,
 	int newargc;
 	int next;			/* place for next argument */
 	char **newargv;
-	size_t bytes;
 	chunk_t src, line, token;
 	bool good = TRUE;
 	int linepos = 0;
@@ -91,15 +90,27 @@ METHOD(options_t, from, bool,
 	}
 
 	/* determine the file size */
-	fseek(fd, 0, SEEK_END);
-	src.len = ftell(fd);
+	if (fseek(fd, 0, SEEK_END) == -1 || (src.len = ftell(fd)) == -1)
+	{
+		DBG1(DBG_LIB, "optionsfrom: unable to determine size of '%s': %s",
+			 filename, strerror(errno));
+		fclose(fd);
+		return FALSE;
+	}
 	rewind(fd);
 
 	/* allocate one byte more just in case of a missing final newline */
 	src.ptr = this->buffers[this->nuses] = malloc(src.len + 1);
 
 	/* read the whole file into a chunk */
-	bytes = fread(src.ptr, 1, src.len, fd);
+	if (fread(src.ptr, 1, src.len, fd) != src.len)
+	{
+		DBG1(DBG_LIB, "optionsfrom: unable to read file '%s': %s",
+			 filename, strerror(errno));
+		free(src.ptr);
+		fclose(fd);
+		return FALSE;
+	}
 	fclose(fd);
 
 	if (this->room)

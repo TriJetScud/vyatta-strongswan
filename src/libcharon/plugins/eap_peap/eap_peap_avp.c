@@ -16,7 +16,7 @@
 #include "eap_peap_avp.h"
 
 #include <eap/eap.h>
-#include <debug.h>
+#include <utils/debug.h>
 
 /**
  * Microsoft Success and Failure Result AVPs
@@ -45,7 +45,7 @@ struct private_eap_peap_avp_t {
 };
 
 METHOD(eap_peap_avp_t, build, void,
-	private_eap_peap_avp_t *this, tls_writer_t *writer, chunk_t data)
+	private_eap_peap_avp_t *this, bio_writer_t *writer, chunk_t data)
 {
 	u_int8_t code;
 	eap_packet_t *pkt;
@@ -63,14 +63,14 @@ METHOD(eap_peap_avp_t, build, void,
 		avp_data = (pkt->code == EAP_SUCCESS) ? MS_AVP_Success : MS_AVP_Failure;
 	}
 	else
-	{	
+	{
 		avp_data = chunk_skip(data, 4);
 	}
 	writer->write_data(writer, avp_data);
 }
 
 METHOD(eap_peap_avp_t, process, status_t,
-	private_eap_peap_avp_t* this, tls_reader_t *reader, chunk_t *data,
+	private_eap_peap_avp_t* this, bio_reader_t *reader, chunk_t *data,
 	u_int8_t identifier)
 {
 	u_int8_t code;

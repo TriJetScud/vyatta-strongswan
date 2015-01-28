@@ -1,13 +1,17 @@
+AM_CPPFLAGS = \
+	-I$(top_srcdir)/src/libstrongswan \
+	-I$(top_srcdir)/src/libhydra \
+	-I$(top_srcdir)/src/libcharon \
+	-I$(top_srcdir)/src/libsimaka
 
-INCLUDES = -I$(top_srcdir)/src/libstrongswan -I$(top_srcdir)/src/libhydra \
-	-I$(top_srcdir)/src/libcharon
-
-AM_CFLAGS = -rdynamic
+AM_CFLAGS = \
+	$(PLUGIN_CFLAGS)
 
 if MONOLITHIC
 noinst_LTLIBRARIES = libstrongswan-eap-simaka-reauth.la
 else
 plugin_LTLIBRARIES = libstrongswan-eap-simaka-reauth.la
+libstrongswan_eap_simaka_reauth_la_LIBADD = $(top_builddir)/src/libsimaka/libsimaka.la
 endif
 
 libstrongswan_eap_simaka_reauth_la_SOURCES = \

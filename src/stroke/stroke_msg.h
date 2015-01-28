@@ -65,8 +65,10 @@ enum list_flag_t {
 	LIST_OCSP =			0x0200,
 	/** list all supported algorithms */
 	LIST_ALGS =			0x0400,
+	/** list plugin information */
+	LIST_PLUGINS =		0x0800,
 	/** all list options */
-	LIST_ALL =			0x07FF,
+	LIST_ALL =			0x0FFF,
 };
 
 typedef enum reread_flag_t reread_flag_t;
@@ -121,6 +123,10 @@ typedef enum export_flag_t export_flag_t;
 enum export_flag_t {
 	/** export an X509 certificate */
 	EXPORT_X509 =		0x0001,
+	/** export an X509 end entity certificate for a connection */
+	EXPORT_CONN_CERT =	0x0002,
+	/** export the complete trust chain of a connection */
+	EXPORT_CONN_CHAIN =	0x0004,
 };
 
 /**
@@ -144,23 +150,27 @@ struct stroke_end_t {
 	char *id;
 	char *id2;
 	char *eap_id;
+	char *rsakey;
 	char *cert;
 	char *cert2;
 	char *ca;
 	char *ca2;
 	char *groups;
+	char *groups2;
 	char *cert_policy;
 	char *updown;
 	char *address;
 	u_int16_t ikeport;
 	char *sourceip;
-	int sourceip_mask;
+	char *dns;
 	char *subnets;
 	int sendcert;
 	int hostaccess;
 	int tohost;
+	int allow_any;
 	u_int8_t protocol;
-	u_int16_t port;
+	u_int16_t from_port;
+	u_int16_t to_port;
 };
 
 typedef struct stroke_msg_t stroke_msg_t;
@@ -194,6 +204,8 @@ struct stroke_msg_t {
 		STR_STATUS,
 		/* show verbose connection status */
 		STR_STATUS_ALL,
+		/* show verbose connection status, non-blocking variant */
+		STR_STATUS_ALL_NOBLK,
 		/* add a ca information record */
 		STR_ADD_CA,
 		/* delete ca information record */
@@ -212,6 +224,12 @@ struct stroke_msg_t {
 		STR_LEASES,
 		/* export credentials */
 		STR_EXPORT,
+		/* print memory usage details */
+		STR_MEMUSAGE,
+		/* set username and password for a connection */
+		STR_USER_CREDS,
+		/* print/reset counters */
+		STR_COUNTERS,
 		/* more to come */
 	} type;
 
@@ -233,28 +251,31 @@ struct stroke_msg_t {
 		/* data for STR_ADD_CONN */
 		struct {
 			char *name;
-			int ikev2;
-			/* next three are deprecated, use stroke_end_t.auth instead */
-			int auth_method;
-			u_int32_t eap_type;
-			u_int32_t eap_vendor;
+			int version;
 			char *eap_identity;
 			char *aaa_identity;
+			char *xauth_identity;
 			int mode;
 			int mobike;
+			int aggressive;
+			int pushmode;
 			int force_encap;
+			int fragmentation;
 			int ipcomp;
 			time_t inactivity;
 			int proxy_mode;
 			int install_policy;
+			int close_action;
 			u_int32_t reqid;
 			u_int32_t tfc;
+			u_int8_t ikedscp;
 
 			crl_policy_t crl_policy;
 			int unique;
 			struct {
 				char *ike;
 				char *esp;
+				char *ah;
 			} algorithms;
 			struct {
 				int reauth;
@@ -270,6 +291,7 @@ struct stroke_msg_t {
 			} rekey;
 			struct {
 				time_t delay;
+				time_t timeout;
 				int action;
 			} dpd;
 			struct {
@@ -282,6 +304,7 @@ struct stroke_msg_t {
 				u_int32_t mask;
 			} mark_in, mark_out;
 			stroke_end_t me, other;
+			u_int32_t replay_window;
 		} add_conn;
 
 		/* data for STR_ADD_CA */
@@ -333,6 +356,20 @@ struct stroke_msg_t {
 			char *pool;
 			char *address;
 		} leases;
+
+		/* data for STR_USER_CREDS */
+		struct {
+			char *name;
+			char *username;
+			char *password;
+		} user_creds;
+
+		/* data for STR_COUNTERS */
+		struct {
+			/* reset or print counters? */
+			int reset;
+			char *name;
+		} counters;
 	};
 	char buffer[STROKE_BUF_LEN];
 };

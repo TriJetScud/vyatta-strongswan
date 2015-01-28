@@ -50,7 +50,7 @@ METHOD(job_t, destroy, void,
 	free(this);
 }
 
-METHOD(job_t, execute, void,
+METHOD(job_t, execute, job_requeue_t,
 	private_update_sa_job_t *this)
 {
 	ike_sa_t *ike_sa;
@@ -63,15 +63,16 @@ METHOD(job_t, execute, void,
 	}
 	else
 	{
-		/* we update only if other host is NATed, but not our */
-		if (ike_sa->has_condition(ike_sa, COND_NAT_THERE) &&
-			!ike_sa->has_condition(ike_sa, COND_NAT_HERE))
-		{
-			ike_sa->update_hosts(ike_sa, NULL, this->new, FALSE);
-		}
+		ike_sa->update_hosts(ike_sa, NULL, this->new, FALSE);
 		charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa);
 	}
-	destroy(this);
+	return JOB_REQUEUE_NONE;
+}
+
+METHOD(job_t, get_priority, job_priority_t,
+	private_update_sa_job_t *this)
+{
+	return JOB_PRIO_MEDIUM;
 }
 
 /*
@@ -85,6 +86,7 @@ update_sa_job_t *update_sa_job_create(u_int32_t reqid, host_t *new)
 		.public = {
 			.job_interface = {
 				.execute = _execute,
+				.get_priority = _get_priority,
 				.destroy = _destroy,
 			},
 		},

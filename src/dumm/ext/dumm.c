@@ -21,8 +21,8 @@
 
 #include <library.h>
 #include <dumm.h>
-#include <debug.h>
-#include <utils/linked_list.h>
+#include <utils/debug.h>
+#include <collections/linked_list.h>
 
 #undef PACKAGE_NAME
 #undef PACKAGE_TARNAME
@@ -30,6 +30,10 @@
 #undef PACKAGE_STRING
 #undef PACKAGE_BUGREPORT
 #undef PACKAGE_URL
+/* avoid redefintiion of snprintf etc. */
+#define RUBY_DONT_SUBST
+/* undef our _GNU_SOURCE, as it gets redefined by <ruby.h> */
+#undef _GNU_SOURCE
 #include <ruby.h>
 
 static dumm_t *dumm;
@@ -141,7 +145,11 @@ static VALUE guest_hash(VALUE class)
 	if (!rb_cvar_defined(class, id))
 	{
 		VALUE hash = guest_hash_create(class);
+#ifdef RB_CVAR_SET_4_ARGS
 		rb_cvar_set(class, id, hash, 0);
+#else
+		rb_cvar_set(class, id, hash);
+#endif
 		return hash;
 	}
 	return rb_cvar_get(class, id);
@@ -594,21 +602,22 @@ static VALUE iface_add_addr(VALUE self, VALUE name)
 {
 	iface_t *iface;
 	host_t *addr;
+	int bits;
 
-	addr = host_create_from_string(StringValuePtr(name), 0);
+	addr = host_create_from_subnet(StringValuePtr(name), &bits);
 	if (!addr)
 	{
 		rb_raise(rb_eArgError, "invalid IP address");
 	}
 	Data_Get_Struct(self, iface_t, iface);
-	if (!iface->add_address(iface, addr))
+	if (!iface->add_address(iface, addr, bits))
 	{
 		addr->destroy(addr);
 		rb_raise(rb_eRuntimeError, "adding address failed");
 	}
 	if (rb_block_given_p()) {
 		rb_yield(self);
-		iface->delete_address(iface, addr);
+		iface->delete_address(iface, addr, bits);
 	}
 	addr->destroy(addr);
 	return self;
@@ -620,12 +629,13 @@ static VALUE iface_each_addr(int argc, VALUE *argv, VALUE self)
 	linked_list_t *list;
 	iface_t *iface;
 	host_t *addr;
-	char buf[64];
+	char buf[64], *fmt = "%H";
 
 	if (!rb_block_given_p())
 	{
 		rb_raise(rb_eArgError, "must be called with a block");
 	}
+	list = linked_list_create();
 	Data_Get_Struct(self, iface_t, iface);
 	enumerator = iface->create_address_enumerator(iface);
 	while (enumerator->enumerate(enumerator, &addr))
@@ -635,7 +645,7 @@ static VALUE iface_each_addr(int argc, VALUE *argv, VALUE self)
 	enumerator->destroy(enumerator);
 	while (list->remove_first(list, (void**)&addr) == SUCCESS)
 	{
-		snprintf(buf, sizeof(buf), "%H", addr);
+		snprintf(buf, sizeof(buf), fmt, addr);
 		addr->destroy(addr);
 		rb_yield(rb_str_new2(buf));
 	}
@@ -647,21 +657,22 @@ static VALUE iface_del_addr(VALUE self, VALUE vaddr)
 {
 	iface_t *iface;
 	host_t *addr;
+	int bits;
 
-	addr = host_create_from_string(StringValuePtr(vaddr), 0);
+	addr = host_create_from_subnet(StringValuePtr(vaddr), &bits);
 	if (!addr)
 	{
 		rb_raise(rb_eArgError, "invalid IP address");
 	}
 	Data_Get_Struct(self, iface_t, iface);
-	if (!iface->delete_address(iface, addr))
+	if (!iface->delete_address(iface, addr, bits))
 	{
 		addr->destroy(addr);
 		rb_raise(rb_eRuntimeError, "address not found");
 	}
 	if (rb_block_given_p()) {
 		rb_yield(self);
-		iface->add_address(iface, addr);
+		iface->add_address(iface, addr, bits);
 	}
 	addr->destroy(addr);
 	return self;
@@ -731,6 +742,7 @@ static VALUE template_each(int argc, VALUE *argv, VALUE class)
 static void template_init()
 {
 	rbc_template = rb_define_class_under(rbm_dumm , "Template", rb_cObject);
+	rb_include_module(rb_class_of(rbc_template), rb_mEnumerable);
 
 	rb_define_singleton_method(rbc_template, "load", template_load, 1);
 	rb_define_singleton_method(rbc_template, "unload", template_unload, 0);
@@ -764,7 +776,7 @@ void Init_dumm()
 	/* there are too many to report, rubyruby... */
 	setenv("LEAK_DETECTIVE_DISABLE", "1", 1);
 
-	library_init(NULL);
+	library_init(NULL, "dumm");
 
 	dumm = dumm_create(NULL);
 

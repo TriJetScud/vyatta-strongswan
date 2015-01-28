@@ -53,12 +53,18 @@ METHOD(job_t, destroy, void,
 	free(this);
 }
 
-METHOD(job_t, execute, void,
+METHOD(job_t, execute, job_requeue_t,
 	private_acquire_job_t *this)
 {
 	charon->traps->acquire(charon->traps, this->reqid,
 						   this->src_ts, this->dst_ts);
-	destroy(this);
+	return JOB_REQUEUE_NONE;
+}
+
+METHOD(job_t, get_priority, job_priority_t,
+	private_acquire_job_t *this)
+{
+	return JOB_PRIO_MEDIUM;
 }
 
 /*
@@ -74,6 +80,7 @@ acquire_job_t *acquire_job_create(u_int32_t reqid,
 		.public = {
 			.job_interface = {
 				.execute = _execute,
+				.get_priority = _get_priority,
 				.destroy = _destroy,
 			},
 		},

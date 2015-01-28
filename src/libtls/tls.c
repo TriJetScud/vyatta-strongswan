@@ -15,7 +15,7 @@
 
 #include "tls.h"
 
-#include <debug.h>
+#include <utils/debug.h>
 
 #include "tls_protection.h"
 #include "tls_compression.h"
@@ -107,16 +107,6 @@ struct private_tls_t {
 	bool is_server;
 
 	/**
-	 * Server identity
-	 */
-	identification_t *server;
-
-	/**
-	 * Peer identity
-	 */
-	identification_t *peer;
-
-	/**
 	 * Negotiated TLS version
 	 */
 	tls_version_t version;
@@ -182,15 +172,23 @@ struct private_tls_t {
 	size_t outpos;
 
 	/**
-	 * Partial TLS record header received
-	 */
-	tls_record_t head;
-
-	/**
 	 * Position in partially received record header
 	 */
 	size_t headpos;
+
+	/**
+	 * Partial TLS record header received
+	 */
+	tls_record_t head;
 };
+
+/**
+ * Described in header.
+ */
+void libtls_init(void)
+{
+	/* empty */
+}
 
 METHOD(tls_t, process, status_t,
 	private_tls_t *this, void *buf, size_t buflen)
@@ -220,14 +218,7 @@ METHOD(tls_t, process, status_t,
 	{
 		if (this->input.len == 0)
 		{
-			if (buflen < sizeof(tls_record_t))
-			{
-				DBG2(DBG_TLS, "received incomplete TLS record header");
-				memcpy(&this->head, buf, buflen);
-				this->headpos = buflen;
-				break;
-			}
-			while (TRUE)
+			while (buflen >= sizeof(tls_record_t))
 			{
 				/* try to process records inline */
 				record = buf;
@@ -253,6 +244,13 @@ METHOD(tls_t, process, status_t,
 				{
 					return NEED_MORE;
 				}
+			}
+			if (buflen < sizeof(tls_record_t))
+			{
+				DBG2(DBG_TLS, "received incomplete TLS record header");
+				memcpy(&this->head, buf, buflen);
+				this->headpos = buflen;
+				break;
 			}
 		}
 		len = min(buflen, this->input.len - this->inpos);
@@ -351,6 +349,18 @@ METHOD(tls_t, is_server, bool,
 	return this->is_server;
 }
 
+METHOD(tls_t, get_server_id, identification_t*,
+	private_tls_t *this)
+{
+	return this->handshake->get_server_id(this->handshake);
+}
+
+METHOD(tls_t, get_peer_id, identification_t*,
+	private_tls_t *this)
+{
+	return this->handshake->get_peer_id(this->handshake);
+}
+
 METHOD(tls_t, get_version, tls_version_t,
 	private_tls_t *this)
 {
@@ -413,8 +423,6 @@ METHOD(tls_t, destroy, void,
 	this->fragmentation->destroy(this->fragmentation);
 	this->crypto->destroy(this->crypto);
 	this->handshake->destroy(this->handshake);
-	DESTROY_IF(this->peer);
-	this->server->destroy(this->server);
 	DESTROY_IF(this->application);
 	this->alert->destroy(this->alert);
 
@@ -429,7 +437,7 @@ METHOD(tls_t, destroy, void,
  */
 tls_t *tls_create(bool is_server, identification_t *server,
 				  identification_t *peer, tls_purpose_t purpose,
-				  tls_application_t *application)
+				  tls_application_t *application, tls_cache_t *cache)
 {
 	private_tls_t *this;
 
@@ -439,6 +447,7 @@ tls_t *tls_create(bool is_server, identification_t *server,
 		case TLS_PURPOSE_EAP_TTLS:
 		case TLS_PURPOSE_EAP_PEAP:
 		case TLS_PURPOSE_GENERIC:
+		case TLS_PURPOSE_GENERIC_NULLOK:
 			break;
 		default:
 			return NULL;
@@ -449,6 +458,8 @@ tls_t *tls_create(bool is_server, identification_t *server,
 			.process = _process,
 			.build = _build,
 			.is_server = _is_server,
+			.get_server_id = _get_server_id,
+			.get_peer_id = _get_peer_id,
 			.get_version = _get_version,
 			.set_version = _set_version,
 			.get_purpose = _get_purpose,
@@ -458,23 +469,22 @@ tls_t *tls_create(bool is_server, identification_t *server,
 		},
 		.is_server = is_server,
 		.version = TLS_1_2,
-		.server = server->clone(server),
-		.peer = peer ? peer->clone(peer) : NULL,
 		.application = application,
 		.purpose = purpose,
 	);
+	lib->settings->add_fallback(lib->settings, "%s.tls", "libtls", lib->ns);
 
-	this->crypto = tls_crypto_create(&this->public);
+	this->crypto = tls_crypto_create(&this->public, cache);
 	this->alert = tls_alert_create();
 	if (is_server)
 	{
 		this->handshake = &tls_server_create(&this->public, this->crypto,
-							this->alert, this->server, this->peer)->handshake;
+										this->alert, server, peer)->handshake;
 	}
 	else
 	{
 		this->handshake = &tls_peer_create(&this->public, this->crypto,
-							this->alert, this->peer, this->server)->handshake;
+										this->alert, peer, server)->handshake;
 	}
 	this->fragmentation = tls_fragmentation_create(this->handshake, this->alert,
 												   this->application);

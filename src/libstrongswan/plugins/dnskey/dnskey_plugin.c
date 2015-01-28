@@ -17,6 +17,7 @@
 
 #include <library.h>
 #include "dnskey_builder.h"
+#include "dnskey_encoder.h"
 
 typedef struct private_dnskey_plugin_t private_dnskey_plugin_t;
 
@@ -37,11 +38,24 @@ METHOD(plugin_t, get_name, char*,
 	return "dnskey";
 }
 
+METHOD(plugin_t, get_features, int,
+	private_dnskey_plugin_t *this, plugin_feature_t *features[])
+{
+	static plugin_feature_t f[] = {
+		PLUGIN_REGISTER(PUBKEY, dnskey_public_key_load, FALSE),
+			PLUGIN_PROVIDE(PUBKEY, KEY_ANY),
+		PLUGIN_REGISTER(PUBKEY, dnskey_public_key_load, FALSE),
+			PLUGIN_PROVIDE(PUBKEY, KEY_RSA),
+	};
+	*features = f;
+	return countof(f);
+}
+
 METHOD(plugin_t, destroy, void,
 	private_dnskey_plugin_t *this)
 {
-	lib->creds->remove_builder(lib->creds,
-							(builder_function_t)dnskey_public_key_load);
+	lib->encoding->remove_encoder(lib->encoding, dnskey_encoder_encode);
+
 	free(this);
 }
 
@@ -56,15 +70,13 @@ plugin_t *dnskey_plugin_create()
 		.public = {
 			.plugin = {
 				.get_name = _get_name,
-				.reload = (void*)return_false,
+				.get_features = _get_features,
 				.destroy = _destroy,
 			},
 		},
 	);
-	lib->creds->add_builder(lib->creds, CRED_PUBLIC_KEY, KEY_ANY, FALSE,
-							(builder_function_t)dnskey_public_key_load);
-	lib->creds->add_builder(lib->creds, CRED_PUBLIC_KEY, KEY_RSA, FALSE,
-							(builder_function_t)dnskey_public_key_load);
+
+	lib->encoding->add_encoder(lib->encoding, dnskey_encoder_encode);
 
 	return &this->public.plugin;
 }

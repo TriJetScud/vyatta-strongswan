@@ -14,10 +14,11 @@
  */
 
 #include <time.h>
+#include <errno.h>
 
 #include "pki.h"
 
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 #include <credentials/certificates/certificate.h>
 #include <credentials/certificates/x509.h>
 #include <asn1/asn1.h>
@@ -55,12 +56,13 @@ static int self()
 	char *file = NULL, *dn = NULL, *hex = NULL, *error = NULL, *keyid = NULL;
 	identification_t *id = NULL;
 	linked_list_t *san, *ocsp, *permitted, *excluded, *policies, *mappings;
-	int lifetime = 1095;
 	int pathlen = X509_NO_CONSTRAINT, inhibit_any = X509_NO_CONSTRAINT;
-	int inhibit_mapping = X509_NO_CONSTRAINT, require_explicit = X509_NO_CONSTRAINT;
+	int inhibit_mapping = X509_NO_CONSTRAINT;
+	int require_explicit = X509_NO_CONSTRAINT;
 	chunk_t serial = chunk_empty;
 	chunk_t encoding = chunk_empty;
-	time_t not_before, not_after;
+	time_t not_before, not_after, lifetime = 1095 * 24 * 60 * 60;
+	char *datenb = NULL, *datena = NULL, *dateform = NULL;
 	x509_flag_t flags = 0;
 	x509_cert_policy_t *policy = NULL;
 	char *arg;
@@ -87,6 +89,10 @@ static int self()
 				{
 					type = KEY_ECDSA;
 				}
+				else if (streq(arg, "bliss"))
+				{
+					type = KEY_BLISS;
+				}
 				else
 				{
 					error = "invalid input type";
@@ -94,8 +100,7 @@ static int self()
 				}
 				continue;
 			case 'g':
-				digest = get_digest(arg);
-				if (digest == HASH_UNKNOWN)
+				if (!enum_from_name(hash_algorithm_short_names, arg, &digest))
 				{
 					error = "invalid --digest type";
 					goto usage;
@@ -114,12 +119,21 @@ static int self()
 				san->insert_last(san, identification_create_from_string(arg));
 				continue;
 			case 'l':
-				lifetime = atoi(arg);
+				lifetime = atoi(arg) * 24 * 60 * 60;
 				if (!lifetime)
 				{
 					error = "invalid --lifetime value";
 					goto usage;
 				}
+				continue;
+			case 'D':
+				dateform = arg;
+				continue;
+			case 'F':
+				datenb = arg;
+				continue;
+			case 'T':
+				datena = arg;
 				continue;
 			case 's':
 				hex = arg;
@@ -212,6 +226,10 @@ static int self()
 				{
 					flags |= X509_CLIENT_AUTH;
 				}
+				else if (streq(arg, "ikeIntermediate"))
+				{
+					flags |= X509_IKE_INTERMEDIATE;
+				}
 				else if (streq(arg, "crlSign"))
 				{
 					flags |= X509_CRL_SIGN;
@@ -219,6 +237,10 @@ static int self()
 				else if (streq(arg, "ocspSigning"))
 				{
 					flags |= X509_OCSP_SIGNER;
+				}
+				else if (streq(arg, "msSmartcardLogon"))
+				{
+					flags |= X509_MS_SMARTCARD_LOGON;
 				}
 				continue;
 			case 'f':
@@ -240,9 +262,20 @@ static int self()
 		break;
 	}
 
+	if (type == KEY_BLISS)
+	{
+		/* currently only SHA-512 is supported */
+		digest = HASH_SHA512;
+	}
 	if (!dn)
 	{
 		error = "--dn is required";
+		goto usage;
+	}
+	if (!calculate_lifetime(dateform, datenb, datena, lifetime,
+							&not_before, &not_after))
+	{
+		error = "invalid --not-before/after datetime";
 		goto usage;
 	}
 	id = identification_create_from_string(dn);
@@ -267,8 +300,18 @@ static int self()
 	}
 	else
 	{
+		chunk_t chunk;
+
+		set_file_mode(stdin, CERT_ASN1_DER);
+		if (!chunk_from_fd(0, &chunk))
+		{
+			fprintf(stderr, "%s: ", strerror(errno));
+			error = "reading private key failed";
+			goto end;
+		}
 		private = lib->creds->create(lib->creds, CRED_PRIVATE_KEY, type,
-									 BUILD_FROM_FD, 0, BUILD_END);
+									 BUILD_BLOB, chunk, BUILD_END);
+		free(chunk.ptr);
 	}
 	if (!private)
 	{
@@ -294,16 +337,15 @@ static int self()
 			error = "no random number generator found";
 			goto end;
 		}
-		rng->allocate_bytes(rng, 8, &serial);
-		while (*serial.ptr == 0x00)
+		if (!rng_allocate_bytes_not_zero(rng, 8, &serial, FALSE))
 		{
-			/* we don't accept a serial number with leading zeroes */
-			rng->get_bytes(rng, 1, serial.ptr);
+			error = "failed to generate serial number";
+			rng->destroy(rng);
+			goto end;
 		}
+		serial.ptr[0] &= 0x7F;
 		rng->destroy(rng);
 	}
-	not_before = time(NULL);
-	not_after = not_before + lifetime * 24 * 60 * 60;
 	cert = lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509,
 						BUILD_SIGNING_KEY, private, BUILD_PUBLIC_KEY, public,
 						BUILD_SUBJECT, id, BUILD_NOT_BEFORE_TIME, not_before,
@@ -329,6 +371,7 @@ static int self()
 		error = "encoding certificate failed";
 		goto end;
 	}
+	set_file_mode(stdout, form);
 	if (fwrite(encoding.ptr, encoding.len, 1, stdout) != 1)
 	{
 		error = "writing certificate key failed";
@@ -374,14 +417,14 @@ static void __attribute__ ((constructor))reg()
 	command_register((command_t) {
 		self, 's', "self",
 		"create a self signed certificate",
-		{"[--in file | --keyid hex] [--type rsa|ecdsa]",
+		{" [--in file|--keyid hex] [--type rsa|ecdsa|bliss]",
 		 " --dn distinguished-name [--san subjectAltName]+",
 		 "[--lifetime days] [--serial hex] [--ca] [--ocsp uri]+",
-		 "[--flag serverAuth|clientAuth|crlSign|ocspSigning]+",
+		 "[--flag serverAuth|clientAuth|crlSign|ocspSigning|msSmartcardLogon]+",
 		 "[--nc-permitted name] [--nc-excluded name]",
-		 "[--cert-policy oid [--cps-uri uri] [--user-notice text] ]+",
 		 "[--policy-map issuer-oid:subject-oid]",
 		 "[--policy-explicit len] [--policy-inhibit len] [--policy-any len]",
+		 "[--cert-policy oid [--cps-uri uri] [--user-notice text]]+",
 		 "[--digest md5|sha1|sha224|sha256|sha384|sha512] [--outform der|pem]"},
 		{
 			{"help",			'h', 0, "show usage information"},
@@ -391,6 +434,9 @@ static void __attribute__ ((constructor))reg()
 			{"dn",				'd', 1, "subject and issuer distinguished name"},
 			{"san",				'a', 1, "subjectAltName to include in certificate"},
 			{"lifetime",		'l', 1, "days the certificate is valid, default: 1095"},
+			{"not-before",		'F', 1, "date/time the validity of the cert starts"},
+			{"not-after",		'T', 1, "date/time the validity of the cert ends"},
+			{"dateform",		'D', 1, "strptime(3) input format, default: %d.%m.%y %T"},
 			{"serial",			's', 1, "serial number in hex, default: random"},
 			{"ca",				'b', 0, "include CA basicConstraint, default: no"},
 			{"pathlen",			'p', 1, "set path length constraint"},

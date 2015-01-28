@@ -37,14 +37,14 @@ struct private_auth_controller_t {
 	manager_t *manager;
 };
 
-static void login(private_auth_controller_t *this, request_t *request)
+static void login(private_auth_controller_t *this, fast_request_t *request)
 {
 	request->set(request, "action", "check");
 	request->set(request, "title", "Login");
 	request->render(request, "templates/auth/login.cs");
 }
 
-static void check(private_auth_controller_t *this, request_t *request)
+static void check(private_auth_controller_t *this, fast_request_t *request)
 {
 	char *username, *password;
 
@@ -61,25 +61,21 @@ static void check(private_auth_controller_t *this, request_t *request)
 	}
 }
 
-static void logout(private_auth_controller_t *this, request_t *request)
+static void logout(private_auth_controller_t *this, fast_request_t *request)
 {
 	this->manager->logout(this->manager);
 	request->redirect(request, "auth/login");
 }
 
-/**
- * Implementation of controller_t.get_name
- */
-static char* get_name(private_auth_controller_t *this)
+METHOD(fast_controller_t, get_name, char*,
+	private_auth_controller_t *this)
 {
 	return "auth";
 }
 
-/**
- * Implementation of controller_t.handle
- */
-static void handle(private_auth_controller_t *this,
-				   request_t *request, char *action)
+METHOD(fast_controller_t, handle, void,
+	private_auth_controller_t *this, fast_request_t *request, char *action,
+	char *p2, char *p3, char *p4, char *p5)
 {
 	if (action)
 	{
@@ -99,10 +95,8 @@ static void handle(private_auth_controller_t *this,
 	request->redirect(request, "auth/login");
 }
 
-/**
- * Implementation of controller_t.destroy
- */
-static void destroy(private_auth_controller_t *this)
+METHOD(fast_controller_t, destroy, void,
+	private_auth_controller_t *this)
 {
 	free(this);
 }
@@ -110,16 +104,20 @@ static void destroy(private_auth_controller_t *this)
 /*
  * see header file
  */
-controller_t *auth_controller_create(context_t *context, void *param)
+fast_controller_t *auth_controller_create(fast_context_t *context, void *param)
 {
-	private_auth_controller_t *this = malloc_thing(private_auth_controller_t);
+	private_auth_controller_t *this;
 
-	this->public.controller.get_name = (char*(*)(controller_t*))get_name;
-	this->public.controller.handle = (void(*)(controller_t*,request_t*,char*,char*,char*,char*,char*))handle;
-	this->public.controller.destroy = (void(*)(controller_t*))destroy;
-
-	this->manager = (manager_t*)context;
+	INIT(this,
+		.public = {
+			.controller = {
+				.get_name = _get_name,
+				.handle = _handle,
+				.destroy = _destroy,
+			},
+		},
+		.manager = (manager_t*)context,
+	);
 
 	return &this->public.controller;
 }
-

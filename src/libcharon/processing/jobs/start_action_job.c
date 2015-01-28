@@ -36,23 +36,19 @@ METHOD(job_t, destroy, void,
 	free(this);
 }
 
-METHOD(job_t, execute, void,
+METHOD(job_t, execute, job_requeue_t,
 	private_start_action_job_t *this)
 {
 	enumerator_t *enumerator, *children;
 	peer_cfg_t *peer_cfg;
 	child_cfg_t *child_cfg;
+	ipsec_mode_t mode;
 	char *name;
 
 	enumerator = charon->backends->create_peer_cfg_enumerator(charon->backends,
-													NULL, NULL, NULL, NULL);
+											NULL, NULL, NULL, NULL, IKE_ANY);
 	while (enumerator->enumerate(enumerator, &peer_cfg))
 	{
-		if (peer_cfg->get_ike_version(peer_cfg) != 2)
-		{
-			continue;
-		}
-
 		children = peer_cfg->create_child_cfg_enumerator(peer_cfg);
 		while (children->enumerate(children, &child_cfg))
 		{
@@ -65,11 +61,20 @@ METHOD(job_t, execute, void,
 					charon->controller->initiate(charon->controller,
 												 peer_cfg->get_ref(peer_cfg),
 												 child_cfg->get_ref(child_cfg),
-												 NULL, NULL);
+												 NULL, NULL, 0);
 					break;
 				case ACTION_ROUTE:
 					DBG1(DBG_JOB, "start action: route '%s'", name);
-					charon->traps->install(charon->traps, peer_cfg, child_cfg);
+					mode = child_cfg->get_mode(child_cfg);
+					if (mode == MODE_PASS || mode == MODE_DROP)
+					{
+						charon->shunts->install(charon->shunts, child_cfg);
+					}
+					else
+					{
+						charon->traps->install(charon->traps, peer_cfg,
+											   child_cfg, 0);
+					}
 					break;
 				case ACTION_NONE:
 					break;
@@ -78,7 +83,13 @@ METHOD(job_t, execute, void,
 		children->destroy(children);
 	}
 	enumerator->destroy(enumerator);
-	destroy(this);
+	return JOB_REQUEUE_NONE;
+}
+
+METHOD(job_t, get_priority, job_priority_t,
+	private_start_action_job_t *this)
+{
+	return JOB_PRIO_MEDIUM;
 }
 
 /*
@@ -92,10 +103,11 @@ start_action_job_t *start_action_job_create(void)
 		.public = {
 			.job_interface = {
 				.execute = _execute,
+				.get_priority = _get_priority,
 				.destroy = _destroy,
 			},
 		},
-	)
+	);
 	return &this->public;
 }
 

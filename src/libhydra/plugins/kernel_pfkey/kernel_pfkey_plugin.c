@@ -38,11 +38,20 @@ METHOD(plugin_t, get_name, char*,
 	return "kernel-pfkey";
 }
 
+METHOD(plugin_t, get_features, int,
+	private_kernel_pfkey_plugin_t *this, plugin_feature_t *features[])
+{
+	static plugin_feature_t f[] = {
+		PLUGIN_CALLBACK(kernel_ipsec_register, kernel_pfkey_ipsec_create),
+			PLUGIN_PROVIDE(CUSTOM, "kernel-ipsec"),
+	};
+	*features = f;
+	return countof(f);
+}
+
 METHOD(plugin_t, destroy, void,
 	private_kernel_pfkey_plugin_t *this)
 {
-	hydra->kernel_interface->remove_ipsec_interface(hydra->kernel_interface,
-						(kernel_ipsec_constructor_t)kernel_pfkey_ipsec_create);
 	free(this);
 }
 
@@ -53,17 +62,21 @@ plugin_t *kernel_pfkey_plugin_create()
 {
 	private_kernel_pfkey_plugin_t *this;
 
+	if (!lib->caps->check(lib->caps, CAP_NET_ADMIN))
+	{	/* required to open PF_KEY sockets */
+		DBG1(DBG_KNL, "kernel-pfkey plugin requires CAP_NET_ADMIN capability");
+		return NULL;
+	}
+
 	INIT(this,
 		.public = {
 			.plugin = {
 				.get_name = _get_name,
-				.reload = (void*)return_false,
+				.get_features = _get_features,
 				.destroy = _destroy,
 			},
 		},
 	);
-	hydra->kernel_interface->add_ipsec_interface(hydra->kernel_interface,
-						(kernel_ipsec_constructor_t)kernel_pfkey_ipsec_create);
 
 	return &this->public.plugin;
 }

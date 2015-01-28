@@ -1,4 +1,5 @@
 /*
+ * Copyright (C) 2011-2013 Tobias Brunner
  * Copyright (C) 2008 Martin Willi
  * Hochschule fuer Technik Rapperswil
  *
@@ -20,21 +21,26 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 
 #include <hydra.h>
 #include <daemon.h>
-#include <threading/thread.h>
-#include <processing/jobs/callback_job.h>
 
 #include "stroke_config.h"
 #include "stroke_control.h"
 #include "stroke_cred.h"
 #include "stroke_ca.h"
 #include "stroke_attribute.h"
+#include "stroke_handler.h"
 #include "stroke_list.h"
+#include "stroke_counter.h"
+
+/**
+ * To avoid clogging the thread pool with (blocking) jobs, we limit the number
+ * of concurrently handled stroke commands.
+ */
+#define MAX_CONCURRENT_DEFAULT 4
 
 typedef struct stroke_job_context_t stroke_job_context_t;
 typedef struct private_stroke_socket_t private_stroke_socket_t;
@@ -50,14 +56,9 @@ struct private_stroke_socket_t {
 	stroke_socket_t public;
 
 	/**
-	 * Unix socket to listen for strokes
+	 * Service accepting stroke connections
 	 */
-	int socket;
-
-	/**
-	 * job accepting stroke messages
-	 */
-	callback_job_t *job;
+	stream_service_t *service;
 
 	/**
 	 * configuration backend
@@ -68,6 +69,11 @@ struct private_stroke_socket_t {
 	 * attribute provider
 	 */
 	stroke_attribute_t *attribute;
+
+	/**
+	 * attribute handler (requests only)
+	 */
+	stroke_handler_t *handler;
 
 	/**
 	 * controller to control daemon
@@ -85,26 +91,33 @@ struct private_stroke_socket_t {
 	stroke_ca_t *ca;
 
 	/**
-	 * Status information logging
+	 * status information logging
 	 */
 	stroke_list_t *list;
+
+	/**
+	 * Counter values for IKE events
+	 */
+	stroke_counter_t *counter;
+
+	/**
+	 * TRUE if log level changes are not allowed
+	 */
+	bool prevent_loglevel_changes;
 };
 
 /**
- * job context to pass to processing thread
+ * Helper macro to log configuration options, but only if they are defined.
  */
-struct stroke_job_context_t {
-
-	/**
-	 * file descriptor to read from
-	 */
-	int fd;
-
-	/**
-	 * global stroke interface
-	 */
-	private_stroke_socket_t *this;
-};
+#define DBG_OPT(...) VA_ARGS_DISPATCH(DBG_OPT, __VA_ARGS__)(__VA_ARGS__)
+#define DBG_OPT2(fmt, val) ({ \
+	typeof(val) _val = val; \
+	if (_val) { DBG2(DBG_CFG, fmt, _val); } \
+})
+#define DBG_OPT3(fmt, label, val) ({ \
+	typeof(val) _val = val; \
+	if (_val) { DBG2(DBG_CFG, fmt, label, _val); } \
+})
 
 /**
  * Helper function which corrects the string pointers
@@ -142,31 +155,37 @@ static void pop_end(stroke_msg_t *msg, const char* label, stroke_end_t *end)
 	pop_string(msg, &end->address);
 	pop_string(msg, &end->subnets);
 	pop_string(msg, &end->sourceip);
+	pop_string(msg, &end->dns);
 	pop_string(msg, &end->auth);
 	pop_string(msg, &end->auth2);
 	pop_string(msg, &end->id);
 	pop_string(msg, &end->id2);
+	pop_string(msg, &end->rsakey);
 	pop_string(msg, &end->cert);
 	pop_string(msg, &end->cert2);
 	pop_string(msg, &end->ca);
 	pop_string(msg, &end->ca2);
 	pop_string(msg, &end->groups);
+	pop_string(msg, &end->groups2);
 	pop_string(msg, &end->cert_policy);
 	pop_string(msg, &end->updown);
 
-	DBG2(DBG_CFG, "  %s=%s", label, end->address);
-	DBG2(DBG_CFG, "  %ssubnet=%s", label, end->subnets);
-	DBG2(DBG_CFG, "  %ssourceip=%s", label, end->sourceip);
-	DBG2(DBG_CFG, "  %sauth=%s", label, end->auth);
-	DBG2(DBG_CFG, "  %sauth2=%s", label, end->auth2);
-	DBG2(DBG_CFG, "  %sid=%s", label, end->id);
-	DBG2(DBG_CFG, "  %sid2=%s", label, end->id2);
-	DBG2(DBG_CFG, "  %scert=%s", label, end->cert);
-	DBG2(DBG_CFG, "  %scert2=%s", label, end->cert2);
-	DBG2(DBG_CFG, "  %sca=%s", label, end->ca);
-	DBG2(DBG_CFG, "  %sca2=%s", label, end->ca2);
-	DBG2(DBG_CFG, "  %sgroups=%s", label, end->groups);
-	DBG2(DBG_CFG, "  %supdown=%s", label, end->updown);
+	DBG_OPT("  %s=%s", label, end->address);
+	DBG_OPT("  %ssubnet=%s", label, end->subnets);
+	DBG_OPT("  %ssourceip=%s", label, end->sourceip);
+	DBG_OPT("  %sdns=%s", label, end->dns);
+	DBG_OPT("  %sauth=%s", label, end->auth);
+	DBG_OPT("  %sauth2=%s", label, end->auth2);
+	DBG_OPT("  %sid=%s", label, end->id);
+	DBG_OPT("  %sid2=%s", label, end->id2);
+	DBG_OPT("  %srsakey=%s", label, end->rsakey);
+	DBG_OPT("  %scert=%s", label, end->cert);
+	DBG_OPT("  %scert2=%s", label, end->cert2);
+	DBG_OPT("  %sca=%s", label, end->ca);
+	DBG_OPT("  %sca2=%s", label, end->ca2);
+	DBG_OPT("  %sgroups=%s", label, end->groups);
+	DBG_OPT("  %sgroups2=%s", label, end->groups2);
+	DBG_OPT("  %supdown=%s", label, end->updown);
 }
 
 /**
@@ -182,20 +201,30 @@ static void stroke_add_conn(private_stroke_socket_t *this, stroke_msg_t *msg)
 	pop_end(msg, "right", &msg->add_conn.other);
 	pop_string(msg, &msg->add_conn.eap_identity);
 	pop_string(msg, &msg->add_conn.aaa_identity);
+	pop_string(msg, &msg->add_conn.xauth_identity);
 	pop_string(msg, &msg->add_conn.algorithms.ike);
 	pop_string(msg, &msg->add_conn.algorithms.esp);
+	pop_string(msg, &msg->add_conn.algorithms.ah);
 	pop_string(msg, &msg->add_conn.ikeme.mediated_by);
 	pop_string(msg, &msg->add_conn.ikeme.peerid);
-	DBG2(DBG_CFG, "  eap_identity=%s", msg->add_conn.eap_identity);
-	DBG2(DBG_CFG, "  aaa_identity=%s", msg->add_conn.aaa_identity);
-	DBG2(DBG_CFG, "  ike=%s", msg->add_conn.algorithms.ike);
-	DBG2(DBG_CFG, "  esp=%s", msg->add_conn.algorithms.esp);
-	DBG2(DBG_CFG, "  mediation=%s", msg->add_conn.ikeme.mediation ? "yes" : "no");
-	DBG2(DBG_CFG, "  mediated_by=%s", msg->add_conn.ikeme.mediated_by);
-	DBG2(DBG_CFG, "  me_peerid=%s", msg->add_conn.ikeme.peerid);
+	DBG_OPT("  eap_identity=%s", msg->add_conn.eap_identity);
+	DBG_OPT("  aaa_identity=%s", msg->add_conn.aaa_identity);
+	DBG_OPT("  xauth_identity=%s", msg->add_conn.xauth_identity);
+	DBG_OPT("  ike=%s", msg->add_conn.algorithms.ike);
+	DBG_OPT("  esp=%s", msg->add_conn.algorithms.esp);
+	DBG_OPT("  ah=%s", msg->add_conn.algorithms.ah);
+	DBG_OPT("  dpddelay=%d", msg->add_conn.dpd.delay);
+	DBG_OPT("  dpdtimeout=%d", msg->add_conn.dpd.timeout);
+	DBG_OPT("  dpdaction=%d", msg->add_conn.dpd.action);
+	DBG_OPT("  closeaction=%d", msg->add_conn.close_action);
+	DBG_OPT("  mediation=%s", msg->add_conn.ikeme.mediation ? "yes" : "no");
+	DBG_OPT("  mediated_by=%s", msg->add_conn.ikeme.mediated_by);
+	DBG_OPT("  me_peerid=%s", msg->add_conn.ikeme.peerid);
+	DBG_OPT("  keyexchange=ikev%u", msg->add_conn.version);
 
 	this->config->add(this->config, msg);
-	this->attribute->add_pool(this->attribute, msg);
+	this->attribute->add_dns(this->attribute, msg);
+	this->handler->add_attributes(this->handler, msg);
 }
 
 /**
@@ -207,7 +236,8 @@ static void stroke_del_conn(private_stroke_socket_t *this, stroke_msg_t *msg)
 	DBG1(DBG_CFG, "received stroke: delete connection '%s'", msg->del_conn.name);
 
 	this->config->del(this->config, msg);
-	this->attribute->del_pool(this->attribute, msg);
+	this->attribute->del_dns(this->attribute, msg);
+	this->handler->del_attributes(this->handler, msg);
 }
 
 /**
@@ -294,13 +324,13 @@ static void stroke_add_ca(private_stroke_socket_t *this,
 	pop_string(msg, &msg->add_ca.ocspuri);
 	pop_string(msg, &msg->add_ca.ocspuri2);
 	pop_string(msg, &msg->add_ca.certuribase);
-	DBG2(DBG_CFG, "ca %s",            msg->add_ca.name);
-	DBG2(DBG_CFG, "  cacert=%s",      msg->add_ca.cacert);
-	DBG2(DBG_CFG, "  crluri=%s",      msg->add_ca.crluri);
-	DBG2(DBG_CFG, "  crluri2=%s",     msg->add_ca.crluri2);
-	DBG2(DBG_CFG, "  ocspuri=%s",     msg->add_ca.ocspuri);
-	DBG2(DBG_CFG, "  ocspuri2=%s",    msg->add_ca.ocspuri2);
-	DBG2(DBG_CFG, "  certuribase=%s", msg->add_ca.certuribase);
+	DBG2(DBG_CFG, "ca %s", msg->add_ca.name);
+	DBG_OPT("  cacert=%s", msg->add_ca.cacert);
+	DBG_OPT("  crluri=%s", msg->add_ca.crluri);
+	DBG_OPT("  crluri2=%s", msg->add_ca.crluri2);
+	DBG_OPT("  ocspuri=%s", msg->add_ca.ocspuri);
+	DBG_OPT("  ocspuri2=%s", msg->add_ca.ocspuri2);
+	DBG_OPT("  certuribase=%s", msg->add_ca.certuribase);
 
 	this->ca->add(this->ca, msg);
 }
@@ -322,17 +352,18 @@ static void stroke_del_ca(private_stroke_socket_t *this,
  * show status of daemon
  */
 static void stroke_status(private_stroke_socket_t *this,
-						  stroke_msg_t *msg, FILE *out, bool all)
+						  stroke_msg_t *msg, FILE *out, bool all, bool wait)
 {
 	pop_string(msg, &(msg->status.name));
 
-	this->list->status(this->list, msg, out, all);
+	this->list->status(this->list, msg, out, all, wait);
 }
 
 /**
  * list various information
  */
-static void stroke_list(private_stroke_socket_t *this, stroke_msg_t *msg, FILE *out)
+static void stroke_list(private_stroke_socket_t *this, stroke_msg_t *msg,
+						FILE *out)
 {
 	if (msg->list.flags & LIST_CAINFOS)
 	{
@@ -375,6 +406,20 @@ static void stroke_purge(private_stroke_socket_t *this,
 }
 
 /**
+ * Print a certificate in PEM to out
+ */
+static void print_pem_cert(FILE *out, certificate_t *cert)
+{
+	chunk_t encoded;
+
+	if (cert->get_encoding(cert, CERT_PEM, &encoded))
+	{
+		fprintf(out, "%.*s", (int)encoded.len, encoded.ptr);
+		free(encoded.ptr);
+	}
+}
+
+/**
  * Export in-memory credentials
  */
 static void stroke_export(private_stroke_socket_t *this,
@@ -382,26 +427,71 @@ static void stroke_export(private_stroke_socket_t *this,
 {
 	pop_string(msg, &msg->export.selector);
 
-	if (msg->purge.flags & EXPORT_X509)
+	if (msg->export.flags & EXPORT_X509)
 	{
 		enumerator_t *enumerator;
 		identification_t *id;
 		certificate_t *cert;
-		chunk_t encoded;
 
 		id = identification_create_from_string(msg->export.selector);
 		enumerator = lib->credmgr->create_cert_enumerator(lib->credmgr,
 												CERT_X509, KEY_ANY, id, FALSE);
 		while (enumerator->enumerate(enumerator, &cert))
 		{
-			if (cert->get_encoding(cert, CERT_PEM, &encoded))
-			{
-				fprintf(out, "%.*s", (int)encoded.len, encoded.ptr);
-				free(encoded.ptr);
-			}
+			print_pem_cert(out, cert);
 		}
 		enumerator->destroy(enumerator);
 		id->destroy(id);
+	}
+
+	if (msg->export.flags & (EXPORT_CONN_CERT | EXPORT_CONN_CHAIN))
+	{
+		enumerator_t *sas, *auths, *certs;
+		ike_sa_t *ike_sa;
+		auth_cfg_t *auth;
+		certificate_t *cert;
+		auth_rule_t rule;
+
+		sas = charon->ike_sa_manager->create_enumerator(
+												charon->ike_sa_manager, TRUE);
+		while (sas->enumerate(sas, &ike_sa))
+		{
+			if (streq(msg->export.selector, ike_sa->get_name(ike_sa)))
+			{
+				auths = ike_sa->create_auth_cfg_enumerator(ike_sa, FALSE);
+				while (auths->enumerate(auths, &auth))
+				{
+					bool got_subject = FALSE;
+
+					certs = auth->create_enumerator(auth);
+					while (certs->enumerate(certs, &rule, &cert))
+					{
+						switch (rule)
+						{
+							case AUTH_RULE_CA_CERT:
+							case AUTH_RULE_IM_CERT:
+								if (msg->export.flags & EXPORT_CONN_CHAIN)
+								{
+									print_pem_cert(out, cert);
+								}
+								break;
+							case AUTH_RULE_SUBJECT_CERT:
+								if (!got_subject)
+								{
+									print_pem_cert(out, cert);
+									got_subject = TRUE;
+								}
+								break;
+							default:
+								break;
+						}
+					}
+					certs->destroy(certs);
+				}
+				auths->destroy(auths);
+			}
+		}
+		sas->destroy(sas);
 	}
 }
 
@@ -418,39 +508,102 @@ static void stroke_leases(private_stroke_socket_t *this,
 }
 
 /**
+ * Callback function for usage report
+ */
+static void report_usage(FILE *out, int count, size_t bytes,
+						 backtrace_t *bt, bool detailed)
+{
+	fprintf(out, "%zu bytes total, %d allocations, %zu bytes average:\n",
+			bytes, count, bytes / count);
+	bt->log(bt, out, detailed);
+}
+
+/**
+ * Callback function for memusage summary
+ */
+static void sum_usage(FILE *out, int count, size_t bytes, int whitelisted)
+{
+	fprintf(out, "Total memory usage: %zu\n", bytes);
+}
+
+/**
+ * Show memory usage
+ */
+static void stroke_memusage(private_stroke_socket_t *this,
+							stroke_msg_t *msg, FILE *out)
+{
+	if (lib->leak_detective)
+	{
+		lib->leak_detective->usage(lib->leak_detective,
+								   (leak_detective_report_cb_t)report_usage,
+								   (leak_detective_summary_cb_t)sum_usage, out);
+	}
+}
+
+/**
+ * Set username and password for a connection
+ */
+static void stroke_user_creds(private_stroke_socket_t *this,
+							  stroke_msg_t *msg, FILE *out)
+{
+	pop_string(msg, &msg->user_creds.name);
+	pop_string(msg, &msg->user_creds.username);
+	pop_string(msg, &msg->user_creds.password);
+
+	DBG1(DBG_CFG, "received stroke: user-creds '%s'", msg->user_creds.name);
+
+	this->config->set_user_credentials(this->config, msg, out);
+}
+
+/**
+ * Print stroke counter values
+ */
+static void stroke_counters(private_stroke_socket_t *this,
+							  stroke_msg_t *msg, FILE *out)
+{
+	pop_string(msg, &msg->counters.name);
+
+	if (msg->counters.reset)
+	{
+		this->counter->reset(this->counter, msg->counters.name);
+	}
+	else
+	{
+		this->counter->print(this->counter, out, msg->counters.name);
+	}
+}
+
+/**
  * set the verbosity debug output
  */
 static void stroke_loglevel(private_stroke_socket_t *this,
 							stroke_msg_t *msg, FILE *out)
 {
-	enumerator_t *enumerator;
-	sys_logger_t *sys_logger;
-	file_logger_t *file_logger;
 	debug_t group;
 
 	pop_string(msg, &(msg->loglevel.type));
 	DBG1(DBG_CFG, "received stroke: loglevel %d for %s",
 		 msg->loglevel.level, msg->loglevel.type);
 
-	group = enum_from_name(debug_names, msg->loglevel.type);
-	if (group < 0)
+	if (this->prevent_loglevel_changes)
 	{
-		fprintf(out, "invalid type (%s)!\n", msg->loglevel.type);
+		DBG1(DBG_CFG, "prevented log level change");
+		fprintf(out, "command not allowed!\n");
 		return;
 	}
-	/* we set the loglevel on ALL sys- and file-loggers */
-	enumerator = charon->sys_loggers->create_enumerator(charon->sys_loggers);
-	while (enumerator->enumerate(enumerator, &sys_logger))
+	if (strcaseeq(msg->loglevel.type, "any"))
 	{
-		sys_logger->set_level(sys_logger, group, msg->loglevel.level);
+		group = DBG_ANY;
 	}
-	enumerator->destroy(enumerator);
-	enumerator = charon->file_loggers->create_enumerator(charon->file_loggers);
-	while (enumerator->enumerate(enumerator, &file_logger))
+	else
 	{
-		file_logger->set_level(file_logger, group, msg->loglevel.level);
+		if (!enum_from_name(debug_names, msg->loglevel.type, &group))
+		{
+			fprintf(out, "unknown type '%s'!\n", msg->loglevel.type);
+			return;
+		}
 	}
-	enumerator->destroy(enumerator);
+	charon->set_level(charon, group, msg->loglevel.level);
 }
 
 /**
@@ -463,56 +616,50 @@ static void stroke_config(private_stroke_socket_t *this,
 }
 
 /**
- * destroy a job context
+ * process a stroke request
  */
-static void stroke_job_context_destroy(stroke_job_context_t *this)
-{
-	if (this->fd)
-	{
-		close(this->fd);
-	}
-	free(this);
-}
-
-/**
- * process a stroke request from the socket pointed by "fd"
- */
-static job_requeue_t process(stroke_job_context_t *ctx)
+static bool on_accept(private_stroke_socket_t *this, stream_t *stream)
 {
 	stroke_msg_t *msg;
-	u_int16_t msg_length;
-	ssize_t bytes_read;
+	u_int16_t len;
 	FILE *out;
-	private_stroke_socket_t *this = ctx->this;
-	int strokefd = ctx->fd;
 
-	/* peek the length */
-	bytes_read = recv(strokefd, &msg_length, sizeof(msg_length), MSG_PEEK);
-	if (bytes_read != sizeof(msg_length))
+	/* read length */
+	if (!stream->read_all(stream, &len, sizeof(len)))
 	{
-		DBG1(DBG_CFG, "reading length of stroke message failed: %s",
-			 strerror(errno));
-		return JOB_REQUEUE_NONE;
+		if (errno != EWOULDBLOCK)
+		{
+			DBG1(DBG_CFG, "reading length of stroke message failed: %s",
+				 strerror(errno));
+		}
+		return FALSE;
 	}
 
-	/* read message */
-	msg = alloca(msg_length);
-	bytes_read = recv(strokefd, msg, msg_length, 0);
-	if (bytes_read != msg_length)
+	/* read message (we need an additional byte to terminate the buffer) */
+	msg = malloc(len + 1);
+	msg->length = len;
+	if (!stream->read_all(stream, (char*)msg + sizeof(len), len - sizeof(len)))
 	{
-		DBG1(DBG_CFG, "reading stroke message failed: %s", strerror(errno));
-		return JOB_REQUEUE_NONE;
+		if (errno != EWOULDBLOCK)
+		{
+			DBG1(DBG_CFG, "reading stroke message failed: %s", strerror(errno));
+		}
+		free(msg);
+		return FALSE;
 	}
+	/* make sure even incorrectly unterminated strings don't extend over the
+	 * message boundaries */
+	((char*)msg)[len] = '\0';
 
-	out = fdopen(strokefd, "w+");
-	if (out == NULL)
+	DBG3(DBG_CFG, "stroke message %b", (void*)msg, len);
+
+	out = stream->get_file(stream);
+	if (!out)
 	{
-		DBG1(DBG_CFG, "opening stroke output channel failed: %s", strerror(errno));
-		return JOB_REQUEUE_NONE;
+		DBG1(DBG_CFG, "creating stroke output stream failed");
+		free(msg);
+		return FALSE;
 	}
-
-	DBG3(DBG_CFG, "stroke message %b", (void*)msg, msg_length);
-
 	switch (msg->type)
 	{
 		case STR_INITIATE:
@@ -534,10 +681,13 @@ static job_requeue_t process(stroke_job_context_t *ctx)
 			stroke_rekey(this, msg, out);
 			break;
 		case STR_STATUS:
-			stroke_status(this, msg, out, FALSE);
+			stroke_status(this, msg, out, FALSE, TRUE);
 			break;
 		case STR_STATUS_ALL:
-			stroke_status(this, msg, out, TRUE);
+			stroke_status(this, msg, out, TRUE, TRUE);
+			break;
+		case STR_STATUS_ALL_NOBLK:
+			stroke_status(this, msg, out, TRUE, FALSE);
 			break;
 		case STR_ADD_CONN:
 			stroke_add_conn(this, msg);
@@ -572,109 +722,42 @@ static job_requeue_t process(stroke_job_context_t *ctx)
 		case STR_LEASES:
 			stroke_leases(this, msg, out);
 			break;
+		case STR_MEMUSAGE:
+			stroke_memusage(this, msg, out);
+			break;
+		case STR_USER_CREDS:
+			stroke_user_creds(this, msg, out);
+			break;
+		case STR_COUNTERS:
+			stroke_counters(this, msg, out);
+			break;
 		default:
 			DBG1(DBG_CFG, "received unknown stroke");
 			break;
 	}
+	free(msg);
 	fclose(out);
-	/* fclose() closes underlying FD */
-	ctx->fd = 0;
-	return JOB_REQUEUE_NONE;
+	return FALSE;
 }
 
-/**
- * Implementation of private_stroke_socket_t.stroke_receive.
- */
-static job_requeue_t receive(private_stroke_socket_t *this)
+METHOD(stroke_socket_t, destroy, void,
+	private_stroke_socket_t *this)
 {
-	struct sockaddr_un strokeaddr;
-	int strokeaddrlen = sizeof(strokeaddr);
-	int strokefd;
-	bool oldstate;
-	callback_job_t *job;
-	stroke_job_context_t *ctx;
-
-	oldstate = thread_cancelability(TRUE);
-	strokefd = accept(this->socket, (struct sockaddr *)&strokeaddr, &strokeaddrlen);
-	thread_cancelability(oldstate);
-
-	if (strokefd < 0)
-	{
-		DBG1(DBG_CFG, "accepting stroke connection failed: %s", strerror(errno));
-		return JOB_REQUEUE_FAIR;
-	}
-
-	ctx = malloc_thing(stroke_job_context_t);
-	ctx->fd = strokefd;
-	ctx->this = this;
-	job = callback_job_create((callback_job_cb_t)process,
-							  ctx, (void*)stroke_job_context_destroy, this->job);
-	lib->processor->queue_job(lib->processor, (job_t*)job);
-
-	return JOB_REQUEUE_FAIR;
-}
-
-
-/**
- * initialize and open stroke socket
- */
-static bool open_socket(private_stroke_socket_t *this)
-{
-	struct sockaddr_un socket_addr;
-	mode_t old;
-
-	socket_addr.sun_family = AF_UNIX;
-	strcpy(socket_addr.sun_path, STROKE_SOCKET);
-
-	/* set up unix socket */
-	this->socket = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (this->socket == -1)
-	{
-		DBG1(DBG_CFG, "could not create stroke socket");
-		return FALSE;
-	}
-
-	unlink(socket_addr.sun_path);
-	old = umask(~(S_IRWXU | S_IRWXG));
-	if (bind(this->socket, (struct sockaddr *)&socket_addr, sizeof(socket_addr)) < 0)
-	{
-		DBG1(DBG_CFG, "could not bind stroke socket: %s", strerror(errno));
-		close(this->socket);
-		return FALSE;
-	}
-	umask(old);
-	if (chown(socket_addr.sun_path, charon->uid, charon->gid) != 0)
-	{
-		DBG1(DBG_CFG, "changing stroke socket permissions failed: %s",
-			 strerror(errno));
-	}
-
-	if (listen(this->socket, 10) < 0)
-	{
-		DBG1(DBG_CFG, "could not listen on stroke socket: %s", strerror(errno));
-		close(this->socket);
-		unlink(socket_addr.sun_path);
-		return FALSE;
-	}
-	return TRUE;
-}
-
-/**
- * Implementation of stroke_socket_t.destroy
- */
-static void destroy(private_stroke_socket_t *this)
-{
-	this->job->cancel(this->job);
+	DESTROY_IF(this->service);
 	lib->credmgr->remove_set(lib->credmgr, &this->ca->set);
 	lib->credmgr->remove_set(lib->credmgr, &this->cred->set);
 	charon->backends->remove_backend(charon->backends, &this->config->backend);
 	hydra->attributes->remove_provider(hydra->attributes, &this->attribute->provider);
+	hydra->attributes->remove_handler(hydra->attributes, &this->handler->handler);
+	charon->bus->remove_listener(charon->bus, &this->counter->listener);
 	this->cred->destroy(this->cred);
 	this->ca->destroy(this->ca);
 	this->config->destroy(this->config);
 	this->attribute->destroy(this->attribute);
+	this->handler->destroy(this->handler);
 	this->control->destroy(this->control);
 	this->list->destroy(this->list);
+	this->counter->destroy(this->counter);
 	free(this);
 }
 
@@ -683,32 +766,48 @@ static void destroy(private_stroke_socket_t *this)
  */
 stroke_socket_t *stroke_socket_create()
 {
-	private_stroke_socket_t *this = malloc_thing(private_stroke_socket_t);
+	private_stroke_socket_t *this;
+	int max_concurrent;
+	char *uri;
 
-	this->public.destroy = (void(*)(stroke_socket_t*))destroy;
-
-	if (!open_socket(this))
-	{
-		free(this);
-		return NULL;
-	}
+	INIT(this,
+		.public = {
+			.destroy = _destroy,
+		},
+		.prevent_loglevel_changes = lib->settings->get_bool(lib->settings,
+				"%s.plugins.stroke.prevent_loglevel_changes", FALSE, lib->ns),
+	);
 
 	this->cred = stroke_cred_create();
 	this->attribute = stroke_attribute_create();
+	this->handler = stroke_handler_create();
 	this->ca = stroke_ca_create(this->cred);
-	this->config = stroke_config_create(this->ca, this->cred);
+	this->config = stroke_config_create(this->ca, this->cred, this->attribute);
 	this->control = stroke_control_create();
 	this->list = stroke_list_create(this->attribute);
+	this->counter = stroke_counter_create();
 
 	lib->credmgr->add_set(lib->credmgr, &this->ca->set);
 	lib->credmgr->add_set(lib->credmgr, &this->cred->set);
 	charon->backends->add_backend(charon->backends, &this->config->backend);
 	hydra->attributes->add_provider(hydra->attributes, &this->attribute->provider);
+	hydra->attributes->add_handler(hydra->attributes, &this->handler->handler);
+	charon->bus->add_listener(charon->bus, &this->counter->listener);
 
-	this->job = callback_job_create((callback_job_cb_t)receive,
-									this, NULL, NULL);
-	lib->processor->queue_job(lib->processor, (job_t*)this->job);
+	max_concurrent = lib->settings->get_int(lib->settings,
+				"%s.plugins.stroke.max_concurrent", MAX_CONCURRENT_DEFAULT,
+				lib->ns);
+	uri = lib->settings->get_str(lib->settings,
+				"%s.plugins.stroke.socket", "unix://" STROKE_SOCKET, lib->ns);
+	this->service = lib->streams->create_service(lib->streams, uri, 10);
+	if (!this->service)
+	{
+		DBG1(DBG_CFG, "creating stroke socket failed");
+		destroy(this);
+		return NULL;
+	}
+	this->service->on_accept(this->service, (stream_service_cb_t)on_accept,
+							 this, JOB_PRIO_CRITICAL, max_concurrent);
 
 	return &this->public;
 }
-

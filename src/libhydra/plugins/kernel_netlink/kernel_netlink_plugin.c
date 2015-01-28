@@ -39,13 +39,22 @@ METHOD(plugin_t, get_name, char*,
 	return "kernel-netlink";
 }
 
+METHOD(plugin_t, get_features, int,
+	private_kernel_netlink_plugin_t *this, plugin_feature_t *features[])
+{
+	static plugin_feature_t f[] = {
+		PLUGIN_CALLBACK(kernel_ipsec_register, kernel_netlink_ipsec_create),
+			PLUGIN_PROVIDE(CUSTOM, "kernel-ipsec"),
+		PLUGIN_CALLBACK(kernel_net_register, kernel_netlink_net_create),
+			PLUGIN_PROVIDE(CUSTOM, "kernel-net"),
+	};
+	*features = f;
+	return countof(f);
+}
+
 METHOD(plugin_t, destroy, void,
 	private_kernel_netlink_plugin_t *this)
 {
-	hydra->kernel_interface->remove_ipsec_interface(hydra->kernel_interface,
-					(kernel_ipsec_constructor_t)kernel_netlink_ipsec_create);
-	hydra->kernel_interface->remove_net_interface(hydra->kernel_interface,
-					(kernel_net_constructor_t)kernel_netlink_net_create);
 	free(this);
 }
 
@@ -56,19 +65,23 @@ plugin_t *kernel_netlink_plugin_create()
 {
 	private_kernel_netlink_plugin_t *this;
 
+	if (!lib->caps->keep(lib->caps, CAP_NET_ADMIN))
+	{	/* required to bind/use XFRM sockets / create/modify routing tables, but
+		 * not if only the read-only parts of kernel-netlink-net are used, so
+		 * we don't fail here */
+		DBG1(DBG_KNL, "kernel-netlink plugin might require CAP_NET_ADMIN "
+			 "capability");
+	}
+
 	INIT(this,
 		.public = {
 			.plugin = {
 				.get_name = _get_name,
-				.reload = (void*)return_false,
+				.get_features = _get_features,
 				.destroy = _destroy,
 			},
 		},
 	);
-	hydra->kernel_interface->add_ipsec_interface(hydra->kernel_interface,
-					(kernel_ipsec_constructor_t)kernel_netlink_ipsec_create);
-	hydra->kernel_interface->add_net_interface(hydra->kernel_interface,
-					(kernel_net_constructor_t)kernel_netlink_net_create);
 
 	return &this->public.plugin;
 }

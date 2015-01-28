@@ -1,4 +1,4 @@
-lib_LTLIBRARIES = libhydra.la
+ipseclib_LTLIBRARIES = libhydra.la
 
 libhydra_la_SOURCES = \
 hydra.c hydra.h \
@@ -8,16 +8,23 @@ attributes/attribute_manager.c attributes/attribute_manager.h \
 attributes/mem_pool.c attributes/mem_pool.h \
 kernel/kernel_interface.c kernel/kernel_interface.h \
 kernel/kernel_ipsec.c kernel/kernel_ipsec.h \
-kernel/kernel_net.h \
+kernel/kernel_net.c kernel/kernel_net.h \
 kernel/kernel_listener.h
 
-libhydra_la_LIBADD =
+libhydra_la_LIBADD = \
+  $(top_builddir)/src/libstrongswan/libstrongswan.la
 
-INCLUDES = -I$(top_srcdir)/src/libstrongswan
-AM_CFLAGS = \
--DIPSEC_DIR=\"${ipsecdir}\" \
--DPLUGINDIR=\"${plugindir}\" \
--DSTRONGSWAN_CONF=\"${strongswan_conf}\"
+if USE_WINDOWS
+  libhydra_la_LIBADD += -lws2_32
+endif
+
+AM_CPPFLAGS = \
+	-I$(top_srcdir)/src/libstrongswan \
+	-DIPSEC_DIR=\"${ipsecdir}\" \
+	-DPLUGINDIR=\"${plugindir}\"
+
+AM_LDFLAGS = \
+  -no-undefined
 
 EXTRA_DIST = Android.mk
 
@@ -58,13 +65,6 @@ if MONOLITHIC
 endif
 endif
 
-if USE_KERNEL_KLIPS
-  SUBDIRS += plugins/kernel_klips
-if MONOLITHIC
-  libhydra_la_LIBADD += plugins/kernel_klips/libstrongswan-kernel-klips.la
-endif
-endif
-
 if USE_KERNEL_NETLINK
   SUBDIRS += plugins/kernel_netlink
 if MONOLITHIC
@@ -79,3 +79,7 @@ if MONOLITHIC
 endif
 endif
 
+if MONOLITHIC
+  SUBDIRS += .
+endif
+SUBDIRS += tests

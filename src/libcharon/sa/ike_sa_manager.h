@@ -52,10 +52,12 @@ struct ike_sa_manager_t {
 	/**
 	 * Create and check out a new IKE_SA.
 	 *
+	 * @param version			IKE version of this SA
 	 * @param initiator			TRUE for initiator, FALSE otherwise
 	 * @returns 				created and checked out IKE_SA
 	 */
-	ike_sa_t* (*checkout_new) (ike_sa_manager_t* this, bool initiator);
+	ike_sa_t* (*checkout_new) (ike_sa_manager_t* this, ike_version_t version,
+							   bool initiator);
 
 	/**
 	 * Checkout an IKE_SA by a message.
@@ -162,9 +164,24 @@ struct ike_sa_manager_t {
 	 * While enumerating an IKE_SA, it is temporarily checked out and
 	 * automatically checked in after the current enumeration step.
 	 *
+	 * @param wait				TRUE to wait for checked out SAs, FALSE to skip
 	 * @return					enumerator over all IKE_SAs.
 	 */
-	enumerator_t *(*create_enumerator) (ike_sa_manager_t* this);
+	enumerator_t *(*create_enumerator) (ike_sa_manager_t* this, bool wait);
+
+	/**
+	 * Create an enumerator over ike_sa_id_t*, matching peer identities.
+	 *
+	 * The remote peer is identified by its XAuth or EAP identity, if available.
+	 *
+	 * @param me				local peer identity to match
+	 * @param other				remote peer identity to match
+	 * @param family			address family to match, 0 for any
+	 * @return					enumerator over ike_sa_id_t*
+	 */
+	enumerator_t* (*create_id_enumerator)(ike_sa_manager_t *this,
+								identification_t *me, identification_t *other,
+								int family);
 
 	/**
 	 * Checkin the SA after usage.
@@ -191,6 +208,13 @@ struct ike_sa_manager_t {
 	void (*checkin_and_destroy) (ike_sa_manager_t* this, ike_sa_t *ike_sa);
 
 	/**
+	 * Get the number of IKE_SAs currently registered.
+	 *
+	 * @return					number of registered IKE_SAs
+	 */
+	u_int (*get_count)(ike_sa_manager_t *this);
+
+	/**
 	 * Get the number of IKE_SAs which are in the connecting state.
 	 *
 	 * To prevent the server from resource exhaustion, cookies and other
@@ -203,7 +227,7 @@ struct ike_sa_manager_t {
 	 * @param ip				NULL for all, IP for half open IKE_SAs with IP
 	 * @return					number of half open IKE_SAs
 	 */
-	int (*get_half_open_count) (ike_sa_manager_t *this, host_t *ip);
+	u_int (*get_half_open_count) (ike_sa_manager_t *this, host_t *ip);
 
 	/**
 	 * Delete all existing IKE_SAs and destroy them immediately.

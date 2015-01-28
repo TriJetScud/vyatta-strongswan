@@ -1,8 +1,12 @@
+AM_CPPFLAGS = \
+	-I$(top_srcdir)/src/libstrongswan \
+	-I$(top_srcdir)/src/libhydra \
+	-I$(top_srcdir)/src/libcharon \
+	-I$(top_srcdir)/src/libtls \
+	-I$(top_srcdir)/src/libradius
 
-INCLUDES = -I$(top_srcdir)/src/libstrongswan -I$(top_srcdir)/src/libhydra \
-	-I$(top_srcdir)/src/libcharon -I$(top_srcdir)/src/libtls
-
-AM_CFLAGS = -rdynamic
+AM_CFLAGS = \
+	$(PLUGIN_CFLAGS)
 
 if MONOLITHIC
 noinst_LTLIBRARIES = libstrongswan-eap-ttls.la

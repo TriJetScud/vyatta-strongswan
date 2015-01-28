@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2010 Tobias Brunner
+ * Copyright (C) 2008-2013 Tobias Brunner
  * Copyright (C) 2008 Martin Willi
  * Hochschule fuer Technik Rapperswil
  *
@@ -17,21 +17,23 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <limits.h>
-#include <glob.h>
-#include <libgen.h>
-#include <sys/mman.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
+
+#ifdef HAVE_GLOB_H
+#include <glob.h>
+#endif
 
 #include "stroke_cred.h"
 
 #include <credentials/certificates/x509.h>
 #include <credentials/certificates/crl.h>
 #include <credentials/certificates/ac.h>
+#include <credentials/containers/pkcs12.h>
 #include <credentials/sets/mem_cred.h>
 #include <credentials/sets/callback_cred.h>
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 #include <utils/lexparser.h>
 #include <threading/rwlock.h>
 #include <daemon.h>
@@ -63,9 +65,20 @@ struct private_stroke_cred_t {
 	stroke_cred_t public;
 
 	/**
+	 * secrets file with credential information
+	 */
+	char *secrets_file;
+
+	/**
 	 * credentials
 	 */
 	mem_cred_t *creds;
+
+	/**
+	 * ignore missing CA basic constraint (i.e. treat all certificates in
+	 * ipsec.conf ca sections and ipsec.d/cacerts as CA certificates)
+	 */
+	bool force_ca_cert;
 
 	/**
 	 * cache CRLs to disk?
@@ -73,27 +86,138 @@ struct private_stroke_cred_t {
 	bool cachecrl;
 };
 
+/** Length of smartcard specifier parts (module, keyid) */
+#define SC_PART_LEN 128
+
 /**
- * Implementation of stroke_cred_t.load_ca.
+ * Kind of smartcard specifier token
  */
-static certificate_t* load_ca(private_stroke_cred_t *this, char *filename)
+typedef enum {
+	SC_FORMAT_SLOT_MODULE_KEYID,
+	SC_FORMAT_SLOT_KEYID,
+	SC_FORMAT_KEYID,
+	SC_FORMAT_INVALID,
+} smartcard_format_t;
+
+/**
+ * Parse a smartcard specifier token
+ */
+static smartcard_format_t parse_smartcard(char *smartcard, u_int *slot,
+										  char *module, char *keyid)
 {
-	certificate_t *cert;
+	/* The token has one of the following three formats:
+	 * - %smartcard<slot>@<module>:<keyid>
+	 * - %smartcard<slot>:<keyid>
+	 * - %smartcard:<keyid>
+	 */
+	char buf[2 * SC_PART_LEN], *pos;
+
+	if (sscanf(smartcard, "%%smartcard%u@%255s", slot, buf) == 2)
+	{
+		pos = strchr(buf, ':');
+		if (!pos)
+		{
+			return SC_FORMAT_INVALID;
+		}
+		*pos++ = '\0';
+		snprintf(module, SC_PART_LEN, "%s", buf);
+		snprintf(keyid, SC_PART_LEN, "%s", pos);
+		return SC_FORMAT_SLOT_MODULE_KEYID;
+	}
+	if (sscanf(smartcard, "%%smartcard%u:%127s", slot, keyid) == 2)
+	{
+		return SC_FORMAT_SLOT_KEYID;
+	}
+	if (sscanf(smartcard, "%%smartcard:%127s", keyid) == 1)
+	{
+		return SC_FORMAT_KEYID;
+	}
+	return SC_FORMAT_INVALID;
+}
+
+/**
+ * Load a credential from a smartcard
+ */
+static certificate_t *load_from_smartcard(smartcard_format_t format,
+										  u_int slot, char *module, char *keyid,
+										  credential_type_t type, int subtype)
+{
+	chunk_t chunk;
+	void *cred;
+
+	chunk = chunk_from_hex(chunk_create(keyid, strlen(keyid)), NULL);
+	switch (format)
+	{
+		case SC_FORMAT_SLOT_MODULE_KEYID:
+			cred = lib->creds->create(lib->creds, type, subtype,
+							BUILD_PKCS11_SLOT, slot,
+							BUILD_PKCS11_MODULE, module,
+							BUILD_PKCS11_KEYID, chunk, BUILD_END);
+			break;
+		case SC_FORMAT_SLOT_KEYID:
+			cred = lib->creds->create(lib->creds, type, subtype,
+							BUILD_PKCS11_SLOT, slot,
+							BUILD_PKCS11_KEYID, chunk, BUILD_END);
+			break;
+		case SC_FORMAT_KEYID:
+			cred = lib->creds->create(lib->creds, type, subtype,
+							BUILD_PKCS11_KEYID, chunk, BUILD_END);
+			break;
+		default:
+			cred = NULL;
+			break;
+	}
+	free(chunk.ptr);
+
+	return cred;
+}
+
+METHOD(stroke_cred_t, load_ca, certificate_t*,
+	private_stroke_cred_t *this, char *filename)
+{
+	certificate_t *cert = NULL;
 	char path[PATH_MAX];
 
-	if (*filename == '/')
+	if (strpfx(filename, "%smartcard"))
 	{
-		snprintf(path, sizeof(path), "%s", filename);
+		smartcard_format_t format;
+		char module[SC_PART_LEN], keyid[SC_PART_LEN];
+		u_int slot;
+
+		format = parse_smartcard(filename, &slot, module, keyid);
+		if (format != SC_FORMAT_INVALID)
+		{
+			cert = (certificate_t*)load_from_smartcard(format,
+							slot, module, keyid, CRED_CERTIFICATE, CERT_X509);
+		}
 	}
 	else
 	{
-		snprintf(path, sizeof(path), "%s/%s", CA_CERTIFICATE_DIR, filename);
-	}
+		if (*filename == '/')
+		{
+			snprintf(path, sizeof(path), "%s", filename);
+		}
+		else
+		{
+			snprintf(path, sizeof(path), "%s/%s", CA_CERTIFICATE_DIR, filename);
+		}
 
-	cert = lib->creds->create(lib->creds,
-							  CRED_CERTIFICATE, CERT_X509,
-							  BUILD_FROM_FILE, path,
-							  BUILD_END);
+		if (this->force_ca_cert)
+		{	/* we treat this certificate as a CA certificate even if it has no
+			 * CA basic constraint */
+			cert = lib->creds->create(lib->creds,
+								  CRED_CERTIFICATE, CERT_X509,
+								  BUILD_FROM_FILE, path, BUILD_X509_FLAG, X509_CA,
+								  BUILD_END);
+		}
+		else
+		{
+			cert = lib->creds->create(lib->creds,
+								  CRED_CERTIFICATE, CERT_X509,
+								  BUILD_FROM_FILE, path,
+								  BUILD_END);
+		}
+	}
 	if (cert)
 	{
 		x509_t *x509 = (x509_t*)cert;
@@ -105,32 +229,48 @@ static certificate_t* load_ca(private_stroke_cred_t *this, char *filename)
 			cert->destroy(cert);
 			return NULL;
 		}
+		DBG1(DBG_CFG, "  loaded ca certificate \"%Y\" from '%s'",
+			 cert->get_subject(cert), filename);
 		return this->creds->add_cert_ref(this->creds, TRUE, cert);
 	}
 	return NULL;
 }
 
-/**
- * Implementation of stroke_cred_t.load_peer.
- */
-static certificate_t* load_peer(private_stroke_cred_t *this, char *filename)
+METHOD(stroke_cred_t, load_peer, certificate_t*,
+	private_stroke_cred_t *this, char *filename)
 {
-	certificate_t *cert;
+	certificate_t *cert = NULL;
 	char path[PATH_MAX];
 
-	if (*filename == '/')
+	if (strpfx(filename, "%smartcard"))
 	{
-		snprintf(path, sizeof(path), "%s", filename);
+		smartcard_format_t format;
+		char module[SC_PART_LEN], keyid[SC_PART_LEN];
+		u_int slot;
+
+		format = parse_smartcard(filename, &slot, module, keyid);
+		if (format != SC_FORMAT_INVALID)
+		{
+			cert = (certificate_t*)load_from_smartcard(format,
+							slot, module, keyid, CRED_CERTIFICATE, CERT_X509);
+		}
 	}
 	else
 	{
-		snprintf(path, sizeof(path), "%s/%s", CERTIFICATE_DIR, filename);
-	}
+		if (*filename == '/')
+		{
+			snprintf(path, sizeof(path), "%s", filename);
+		}
+		else
+		{
+			snprintf(path, sizeof(path), "%s/%s", CERTIFICATE_DIR, filename);
+		}
 
-	cert = lib->creds->create(lib->creds,
-							  CRED_CERTIFICATE, CERT_ANY,
-							  BUILD_FROM_FILE, path,
-							  BUILD_END);
+		cert = lib->creds->create(lib->creds,
+								  CRED_CERTIFICATE, CERT_ANY,
+								  BUILD_FROM_FILE, path,
+								  BUILD_END);
+	}
 	if (cert)
 	{
 		cert = this->creds->add_cert_ref(this->creds, TRUE, cert);
@@ -139,6 +279,97 @@ static certificate_t* load_peer(private_stroke_cred_t *this, char *filename)
 		return cert;
 	}
 	DBG1(DBG_CFG, "  loading certificate from '%s' failed", filename);
+	return NULL;
+}
+
+METHOD(stroke_cred_t, load_pubkey, certificate_t*,
+	private_stroke_cred_t *this, char *filename, identification_t *identity)
+{
+	certificate_t *cert;
+	public_key_t *key;
+	char path[PATH_MAX];
+	builder_part_t build_part;
+	key_type_t type = KEY_ANY;
+
+	if (streq(filename, "%dns"))
+	{
+		return NULL;
+	}
+	if (strncaseeq(filename, "dns:", 4))
+	{	/* RFC 3110 format */
+		build_part = BUILD_BLOB_DNSKEY;
+		/* not a complete RR, only RSA supported */
+		type = KEY_RSA;
+		filename += 4;
+	}
+	else if (strncaseeq(filename, "ssh:", 4))
+	{	/* SSH key */
+		build_part = BUILD_BLOB_SSHKEY;
+		filename += 4;
+	}
+	else
+	{	/* try PKCS#1 by default */
+		build_part = BUILD_BLOB_ASN1_DER;
+	}
+	if (strncaseeq(filename, "0x", 2) || strncaseeq(filename, "0s", 2))
+	{
+		chunk_t printable_key, raw_key;
+
+		printable_key = chunk_create(filename + 2, strlen(filename) - 2);
+		raw_key = strncaseeq(filename, "0x", 2) ?
+								 chunk_from_hex(printable_key, NULL) :
+								 chunk_from_base64(printable_key, NULL);
+		key = lib->creds->create(lib->creds, CRED_PUBLIC_KEY, type,
+								 build_part, raw_key, BUILD_END);
+		chunk_free(&raw_key);
+		if (key)
+		{
+			cert = lib->creds->create(lib->creds, CRED_CERTIFICATE,
+									  CERT_TRUSTED_PUBKEY,
+									  BUILD_PUBLIC_KEY, key,
+									  BUILD_SUBJECT, identity,
+									  BUILD_END);
+			type = key->get_type(key);
+			key->destroy(key);
+			if (cert)
+			{
+				cert = this->creds->add_cert_ref(this->creds, TRUE, cert);
+				DBG1(DBG_CFG, "  loaded %N public key for \"%Y\"",
+					 key_type_names, type, identity);
+				return cert;
+			}
+		}
+		DBG1(DBG_CFG, "  loading public key for \"%Y\" failed", identity);
+	}
+	else
+	{
+		if (*filename == '/')
+		{
+			snprintf(path, sizeof(path), "%s", filename);
+		}
+		else
+		{
+			snprintf(path, sizeof(path), "%s/%s", CERTIFICATE_DIR, filename);
+		}
+
+		cert = lib->creds->create(lib->creds,
+								  CRED_CERTIFICATE, CERT_TRUSTED_PUBKEY,
+								  BUILD_FROM_FILE, path,
+								  BUILD_SUBJECT, identity,
+								  BUILD_END);
+		if (cert)
+		{
+			cert = this->creds->add_cert_ref(this->creds, TRUE, cert);
+			key = cert->get_public_key(cert);
+			type = key->get_type(key);
+			key->destroy(key);
+			DBG1(DBG_CFG, "  loaded %N public key for \"%Y\" from '%s'",
+				 key_type_names, type, identity, filename);
+			return cert;
+		}
+		DBG1(DBG_CFG, "  loading public key for \"%Y\" from '%s' failed",
+			 identity, filename);
+	}
 	return NULL;
 }
 
@@ -172,11 +403,21 @@ static void load_certdir(private_stroke_cred_t *this, char *path,
 		{
 			case CERT_X509:
 				if (flag & X509_CA)
-				{	/* for CA certificates, we strictly require
-					 * the CA basic constraint to be set */
-					cert = lib->creds->create(lib->creds,
+				{
+					if (this->force_ca_cert)
+					{	/* treat this certificate as CA cert even it has no
+						 * CA basic constraint */
+						cert = lib->creds->create(lib->creds,
+										CRED_CERTIFICATE, CERT_X509,
+										BUILD_FROM_FILE, file, BUILD_X509_FLAG,
+										X509_CA, BUILD_END);
+					}
+					else
+					{
+						cert = lib->creds->create(lib->creds,
 										CRED_CERTIFICATE, CERT_X509,
 										BUILD_FROM_FILE, file, BUILD_END);
+					}
 					if (cert)
 					{
 						x509_t *x509 = (x509_t*)cert;
@@ -262,10 +503,8 @@ static void load_certdir(private_stroke_cred_t *this, char *path,
 	enumerator->destroy(enumerator);
 }
 
-/**
- * Implementation of credential_set_t.cache_cert.
- */
-static void cache_cert(private_stroke_cred_t *this, certificate_t *cert)
+METHOD(stroke_cred_t, cache_cert, void,
+	private_stroke_cred_t *this, certificate_t *cert)
 {
 	if (cert->get_type(cert) == CERT_X509_CRL && this->cachecrl)
 	{
@@ -285,17 +524,24 @@ static void cache_cert(private_stroke_cred_t *this, certificate_t *cert)
 
 			if (cert->get_encoding(cert, CERT_ASN1_DER, &chunk))
 			{
-				chunk_write(chunk, buf, "crl", 022, TRUE);
+				if (chunk_write(chunk, buf, 022, TRUE))
+				{
+					DBG1(DBG_CFG, "  written crl file '%s' (%d bytes)",
+						 buf, chunk.len);
+				}
+				else
+				{
+					DBG1(DBG_CFG, "  writing crl file '%s' failed: %s",
+						 buf, strerror(errno));
+				}
 				free(chunk.ptr);
 			}
 		}
 	}
 }
 
-/**
- * Implementation of stroke_cred_t.cachecrl.
- */
-static void cachecrl(private_stroke_cred_t *this, bool enabled)
+METHOD(stroke_cred_t, cachecrl, void,
+	private_stroke_cred_t *this, bool enabled)
 {
 	DBG1(DBG_CFG, "crl caching to %s %s",
 		 CRL_DIR, enabled ? "enabled" : "disabled");
@@ -366,8 +612,12 @@ static err_t extract_secret(chunk_t *secret, chunk_t *line)
  * Data for passphrase callback
  */
 typedef struct {
+	/** cached passphrases */
+	mem_cred_t *cache;
 	/** socket we use for prompting */
 	FILE *prompt;
+	/** type of secret to unlock */
+	int type;
 	/** private key file */
 	char *path;
 	/** number of tries */
@@ -375,13 +625,15 @@ typedef struct {
 } passphrase_cb_data_t;
 
 /**
- * Callback function to receive Passphrases
+ * Callback function to receive passphrases
  */
 static shared_key_t* passphrase_cb(passphrase_cb_data_t *data,
-								shared_key_type_t type,
-								identification_t *me, identification_t *other,
-								id_match_t *match_me, id_match_t *match_other)
+								   shared_key_type_t type, identification_t *me,
+								   identification_t *other, id_match_t *match_me,
+								   id_match_t *match_other)
 {
+	static const int max_tries = 3;
+	shared_key_t *shared;
 	chunk_t secret;
 	char buf[256];
 
@@ -390,17 +642,23 @@ static shared_key_t* passphrase_cb(passphrase_cb_data_t *data,
 		return NULL;
 	}
 
+	data->try++;
+	if (data->try > max_tries + 1)
+	{	/* another builder might call this after we gave up, fail silently */
+		return NULL;
+	}
+	if (data->try > max_tries)
+	{
+		fprintf(data->prompt, "Passphrase invalid, giving up.\n");
+		return NULL;
+	}
 	if (data->try > 1)
 	{
-		if (data->try > 5)
-		{
-			fprintf(data->prompt, "PIN invalid, giving up.\n");
-			return NULL;
-		}
-		fprintf(data->prompt, "PIN invalid!\n");
+		fprintf(data->prompt, "Passphrase invalid!\n");
 	}
-	data->try++;
-	fprintf(data->prompt, "Private key '%s' is encrypted.\n", data->path);
+	fprintf(data->prompt, "%s '%s' is encrypted.\n",
+			data->type == CRED_PRIVATE_KEY ? "Private key" : "PKCS#12 file",
+			data->path);
 	fprintf(data->prompt, "Passphrase:\n");
 	if (fgets(buf, sizeof(buf), data->prompt))
 	{
@@ -416,7 +674,10 @@ static shared_key_t* passphrase_cb(passphrase_cb_data_t *data,
 			{
 				*match_other = ID_MATCH_NONE;
 			}
-			return shared_key_create(SHARED_PRIVATE_KEY_PASS, chunk_clone(secret));
+			shared = shared_key_create(SHARED_PRIVATE_KEY_PASS,
+									   chunk_clone(secret));
+			data->cache->add_shared(data->cache, shared->get_ref(shared), NULL);
+			return shared;
 		}
 	}
 	return NULL;
@@ -456,12 +717,12 @@ static shared_key_t* pin_cb(pin_cb_data_t *data, shared_key_type_t type,
 		return NULL;
 	}
 
+	data->try++;
 	if (data->try > 1)
 	{
 		fprintf(data->prompt, "PIN invalid, aborting.\n");
 		return NULL;
 	}
-	data->try++;
 	fprintf(data->prompt, "Login to '%s' required\n", data->card);
 	fprintf(data->prompt, "PIN:\n");
 	if (fgets(buf, sizeof(buf), data->prompt))
@@ -487,11 +748,11 @@ static shared_key_t* pin_cb(pin_cb_data_t *data, shared_key_type_t type,
 /**
  * Load a smartcard with a PIN
  */
-static bool load_pin(private_stroke_cred_t *this, chunk_t line, int line_nr,
+static bool load_pin(mem_cred_t *secrets, chunk_t line, int line_nr,
 					 FILE *prompt)
 {
 	chunk_t sc = chunk_empty, secret = chunk_empty;
-	char smartcard[64], keyid[64], module[64], *pos;
+	char smartcard[BUF_LEN], keyid[SC_PART_LEN], module[SC_PART_LEN];
 	private_key_t *key = NULL;
 	u_int slot;
 	chunk_t chunk;
@@ -500,11 +761,7 @@ static bool load_pin(private_stroke_cred_t *this, chunk_t line, int line_nr,
 	mem_cred_t *mem = NULL;
 	callback_cred_t *cb = NULL;
 	pin_cb_data_t pin_data;
-	enum {
-		SC_FORMAT_SLOT_MODULE_KEYID,
-		SC_FORMAT_SLOT_KEYID,
-		SC_FORMAT_KEYID,
-	} format;
+	smartcard_format_t format;
 
 	err_t ugh = extract_value(&sc, &line);
 
@@ -521,33 +778,8 @@ static bool load_pin(private_stroke_cred_t *this, chunk_t line, int line_nr,
 	snprintf(smartcard, sizeof(smartcard), "%.*s", (int)sc.len, sc.ptr);
 	smartcard[sizeof(smartcard) - 1] = '\0';
 
-	/* parse slot and key id. Three formats are supported:
-	 * - %smartcard<slot>@<module>:<keyid>
-	 * - %smartcard<slot>:<keyid>
-	 * - %smartcard:<keyid>
-	 */
-	if (sscanf(smartcard, "%%smartcard%u@%s", &slot, module) == 2)
-	{
-		pos = strchr(module, ':');
-		if (!pos)
-		{
-			DBG1(DBG_CFG, "line %d: the given %%smartcard specifier is "
-				 "invalid", line_nr);
-			return FALSE;
-		}
-		*pos = '\0';
-		strncpy(keyid, pos + 1, sizeof(keyid));
-		format = SC_FORMAT_SLOT_MODULE_KEYID;
-	}
-	else if (sscanf(smartcard, "%%smartcard%u:%s", &slot, keyid) == 2)
-	{
-		format = SC_FORMAT_SLOT_KEYID;
-	}
-	else if (sscanf(smartcard, "%%smartcard:%s", keyid) == 1)
-	{
-		format = SC_FORMAT_KEYID;
-	}
-	else
+	format = parse_smartcard(smartcard, &slot, module, keyid);
+	if (format == SC_FORMAT_INVALID)
 	{
 		DBG1(DBG_CFG, "line %d: the given %%smartcard specifier is not"
 				" supported or invalid", line_nr);
@@ -567,21 +799,21 @@ static bool load_pin(private_stroke_cred_t *this, chunk_t line, int line_nr,
 	}
 
 	chunk = chunk_from_hex(chunk_create(keyid, strlen(keyid)), NULL);
-	if (secret.len == 7 && strneq(secret.ptr, "%prompt", 7))
+	if (secret.len == 7 && strpfx(secret.ptr, "%prompt"))
 	{
 		free(secret.ptr);
 		if (!prompt)
 		{	/* no IO channel to prompt, skip */
-			free(chunk.ptr);
+			chunk_clear(&chunk);
 			return TRUE;
 		}
 		/* use callback credential set to prompt for the pin */
 		pin_data.prompt = prompt;
 		pin_data.card = smartcard;
 		pin_data.keyid = chunk;
-		pin_data.try = 1;
+		pin_data.try = 0;
 		cb = callback_cred_create_shared((void*)pin_cb, &pin_data);
-		lib->credmgr->add_local_set(lib->credmgr, &cb->set);
+		lib->credmgr->add_local_set(lib->credmgr, &cb->set, FALSE);
 	}
 	else
 	{
@@ -590,31 +822,12 @@ static bool load_pin(private_stroke_cred_t *this, chunk_t line, int line_nr,
 		id = identification_create_from_encoding(ID_KEY_ID, chunk);
 		mem = mem_cred_create();
 		mem->add_shared(mem, shared, id, NULL);
-		lib->credmgr->add_local_set(lib->credmgr, &mem->set);
+		lib->credmgr->add_local_set(lib->credmgr, &mem->set, FALSE);
 	}
 
 	/* unlock: smartcard needs the pin and potentially calls public set */
-	switch (format)
-	{
-		case SC_FORMAT_SLOT_MODULE_KEYID:
-			key = lib->creds->create(lib->creds,
-							CRED_PRIVATE_KEY, KEY_ANY,
-							BUILD_PKCS11_SLOT, slot,
-							BUILD_PKCS11_MODULE, module,
-							BUILD_PKCS11_KEYID, chunk, BUILD_END);
-			break;
-		case SC_FORMAT_SLOT_KEYID:
-			key = lib->creds->create(lib->creds,
-							CRED_PRIVATE_KEY, KEY_ANY,
-							BUILD_PKCS11_SLOT, slot,
-							BUILD_PKCS11_KEYID, chunk, BUILD_END);
-			break;
-		case SC_FORMAT_KEYID:
-			key = lib->creds->create(lib->creds,
-							CRED_PRIVATE_KEY, KEY_ANY,
-							BUILD_PKCS11_KEYID, chunk, BUILD_END);
-			break;
-	}
+	key = (private_key_t*)load_from_smartcard(format, slot, module, keyid,
+											  CRED_PRIVATE_KEY, KEY_ANY);
 	if (mem)
 	{
 		lib->credmgr->remove_local_set(lib->credmgr, &mem->set);
@@ -625,25 +838,25 @@ static bool load_pin(private_stroke_cred_t *this, chunk_t line, int line_nr,
 		lib->credmgr->remove_local_set(lib->credmgr, &cb->set);
 		cb->destroy(cb);
 	}
+	chunk_clear(&chunk);
 
 	if (key)
 	{
-		DBG1(DBG_CFG, "  loaded private key from %.*s", sc.len, sc.ptr);
-		this->creds->add_key(this->creds, key);
+		DBG1(DBG_CFG, "  loaded private key from %.*s", (int)sc.len, sc.ptr);
+		secrets->add_key(secrets, key);
 	}
 	return TRUE;
 }
 
 /**
- * Load a private key
+ * Load a private key or PKCS#12 container from a file
  */
-static bool load_private(private_stroke_cred_t *this, chunk_t line, int line_nr,
-						 FILE *prompt, key_type_t key_type)
+static bool load_from_file(chunk_t line, int line_nr, FILE *prompt,
+						   char *path, int type, int subtype,
+						   void **result)
 {
-	char path[PATH_MAX];
 	chunk_t filename;
 	chunk_t secret = chunk_empty;
-	private_key_t *key;
 
 	err_t ugh = extract_value(&filename, &line);
 
@@ -660,12 +873,12 @@ static bool load_private(private_stroke_cred_t *this, chunk_t line, int line_nr,
 	if (*filename.ptr == '/')
 	{
 		/* absolute path name */
-		snprintf(path, sizeof(path), "%.*s", (int)filename.len, filename.ptr);
+		snprintf(path, PATH_MAX, "%.*s", (int)filename.len, filename.ptr);
 	}
 	else
 	{
 		/* relative path name */
-		snprintf(path, sizeof(path), "%s/%.*s", PRIVATE_KEY_DIR,
+		snprintf(path, PATH_MAX, "%s/%.*s", PRIVATE_KEY_DIR,
 				 (int)filename.len, filename.ptr);
 	}
 
@@ -679,32 +892,37 @@ static bool load_private(private_stroke_cred_t *this, chunk_t line, int line_nr,
 			return FALSE;
 		}
 	}
-	if (secret.len == 7 && strneq(secret.ptr, "%prompt", 7))
+	if (secret.len == 7 && strpfx(secret.ptr, "%prompt"))
 	{
-		callback_cred_t *cb = NULL;
+		callback_cred_t *cb;
 		passphrase_cb_data_t pp_data = {
 			.prompt = prompt,
+			.type = type,
 			.path = path,
-			.try = 1,
+			.try = 0,
 		};
 
 		free(secret.ptr);
 		if (!prompt)
 		{
+			*result = NULL;
 			return TRUE;
 		}
+		/* add cache first so if valid passphrases are needed multiple times
+		 * the callback is not called anymore */
+		pp_data.cache = mem_cred_create();
+		lib->credmgr->add_local_set(lib->credmgr, &pp_data.cache->set, FALSE);
 		/* use callback credential set to prompt for the passphrase */
-		pp_data.prompt = prompt;
-		pp_data.path = path;
-		pp_data.try = 1;
 		cb = callback_cred_create_shared((void*)passphrase_cb, &pp_data);
-		lib->credmgr->add_local_set(lib->credmgr, &cb->set);
+		lib->credmgr->add_local_set(lib->credmgr, &cb->set, FALSE);
 
-		key = lib->creds->create(lib->creds, CRED_PRIVATE_KEY, key_type,
-								 BUILD_FROM_FILE, path, BUILD_END);
+		*result = lib->creds->create(lib->creds, type, subtype,
+									 BUILD_FROM_FILE, path, BUILD_END);
 
 		lib->credmgr->remove_local_set(lib->credmgr, &cb->set);
 		cb->destroy(cb);
+		lib->credmgr->remove_local_set(lib->credmgr, &pp_data.cache->set);
+		pp_data.cache->destroy(pp_data.cache);
 	}
 	else
 	{
@@ -715,19 +933,49 @@ static bool load_private(private_stroke_cred_t *this, chunk_t line, int line_nr,
 		shared = shared_key_create(SHARED_PRIVATE_KEY_PASS, secret);
 		mem = mem_cred_create();
 		mem->add_shared(mem, shared, NULL);
-		lib->credmgr->add_local_set(lib->credmgr, &mem->set);
+		if (eat_whitespace(&line))
+		{	/* if there is a second passphrase add that too, could be needed for
+			 * PKCS#12 files using different passwords for MAC and encryption */
+			ugh = extract_secret(&secret, &line);
+			if (ugh != NULL)
+			{
+				DBG1(DBG_CFG, "line %d: malformed passphrase: %s", line_nr, ugh);
+				mem->destroy(mem);
+				return FALSE;
+			}
+			shared = shared_key_create(SHARED_PRIVATE_KEY_PASS, secret);
+			mem->add_shared(mem, shared, NULL);
+		}
+		lib->credmgr->add_local_set(lib->credmgr, &mem->set, FALSE);
 
-		key = lib->creds->create(lib->creds, CRED_PRIVATE_KEY, key_type,
-								 BUILD_FROM_FILE, path, BUILD_END);
+		*result = lib->creds->create(lib->creds, type, subtype,
+									 BUILD_FROM_FILE, path, BUILD_END);
 
 		lib->credmgr->remove_local_set(lib->credmgr, &mem->set);
 		mem->destroy(mem);
+	}
+	return TRUE;
+}
+
+/**
+ * Load a private key
+ */
+static bool load_private(mem_cred_t *secrets, chunk_t line, int line_nr,
+						 FILE *prompt, key_type_t key_type)
+{
+	char path[PATH_MAX];
+	private_key_t *key;
+
+	if (!load_from_file(line, line_nr, prompt, path, CRED_PRIVATE_KEY,
+						key_type, (void**)&key))
+	{
+		return FALSE;
 	}
 	if (key)
 	{
 		DBG1(DBG_CFG, "  loaded %N private key from '%s'",
 			 key_type_names, key->get_type(key), path);
-		this->creds->add_key(this->creds, key);
+		secrets->add_key(secrets, key);
 	}
 	else
 	{
@@ -737,9 +985,61 @@ static bool load_private(private_stroke_cred_t *this, chunk_t line, int line_nr,
 }
 
 /**
+ * Load a PKCS#12 container
+ */
+static bool load_pkcs12(private_stroke_cred_t *this, mem_cred_t *secrets,
+						chunk_t line, int line_nr, FILE *prompt)
+{
+	enumerator_t *enumerator;
+	char path[PATH_MAX];
+	certificate_t *cert;
+	private_key_t *key;
+	pkcs12_t *pkcs12;
+
+	if (!load_from_file(line, line_nr, prompt, path, CRED_CONTAINER,
+						CONTAINER_PKCS12, (void**)&pkcs12))
+	{
+		return FALSE;
+	}
+	if (!pkcs12)
+	{
+		DBG1(DBG_CFG, "  loading credentials from '%s' failed", path);
+		return TRUE;
+	}
+	enumerator = pkcs12->create_cert_enumerator(pkcs12);
+	while (enumerator->enumerate(enumerator, &cert))
+	{
+		x509_t *x509 = (x509_t*)cert;
+
+		if (x509->get_flags(x509) & X509_CA)
+		{
+			DBG1(DBG_CFG, "  loaded ca certificate \"%Y\" from '%s'",
+				 cert->get_subject(cert), path);
+		}
+		else
+		{
+			DBG1(DBG_CFG, "  loaded certificate \"%Y\" from '%s'",
+				 cert->get_subject(cert), path);
+		}
+		this->creds->add_cert(this->creds, TRUE, cert->get_ref(cert));
+	}
+	enumerator->destroy(enumerator);
+	enumerator = pkcs12->create_key_enumerator(pkcs12);
+	while (enumerator->enumerate(enumerator, &key))
+	{
+		DBG1(DBG_CFG, "  loaded %N private key from '%s'",
+			 key_type_names, key->get_type(key), path);
+		secrets->add_key(secrets, key->get_ref(key));
+	}
+	enumerator->destroy(enumerator);
+	pkcs12->container.destroy(&pkcs12->container);
+	return TRUE;
+}
+
+/**
  * Load a shared key
  */
-static bool load_shared(private_stroke_cred_t *this, chunk_t line, int line_nr,
+static bool load_shared(mem_cred_t *secrets, chunk_t line, int line_nr,
 						shared_key_type_t type, chunk_t ids)
 {
 	shared_key_t *shared_key;
@@ -794,53 +1094,37 @@ static bool load_shared(private_stroke_cred_t *this, chunk_t line, int line_nr,
 		owners->insert_last(owners,
 					identification_create_from_encoding(ID_ANY, chunk_empty));
 	}
-	this->creds->add_shared_list(this->creds, shared_key, owners);
+	secrets->add_shared_list(secrets, shared_key, owners);
 	return TRUE;
 }
 
 /**
  * reload ipsec.secrets
  */
-static void load_secrets(private_stroke_cred_t *this, char *file, int level,
-						 FILE *prompt)
+static void load_secrets(private_stroke_cred_t *this, mem_cred_t *secrets,
+						 char *file, int level, FILE *prompt)
 {
-	int line_nr = 0, fd;
-	chunk_t src, line;
-	struct stat sb;
-	void *addr;
+	int line_nr = 0;
+	chunk_t *src, line;
 
 	DBG1(DBG_CFG, "loading secrets from '%s'", file);
-	fd = open(file, O_RDONLY);
-	if (fd == -1)
+	src = chunk_map(file, FALSE);
+	if (!src)
 	{
 		DBG1(DBG_CFG, "opening secrets file '%s' failed: %s", file,
 			 strerror(errno));
 		return;
 	}
-	if (fstat(fd, &sb) == -1)
-	{
-		DBG1(DBG_LIB, "getting file size of '%s' failed: %s", file,
-			 strerror(errno));
-		close(fd);
-		return;
-	}
-	addr = mmap(NULL, sb.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-	if (addr == MAP_FAILED)
-	{
-		DBG1(DBG_LIB, "mapping '%s' failed: %s", file, strerror(errno));
-		close(fd);
-		return;
-	}
-	src = chunk_create(addr, sb.st_size);
 
-	if (level == 0)
-	{	/* flush secrets on non-recursive invocation */
-		this->creds->clear_secrets(this->creds);
+	if (!secrets)
+	{
+		secrets = mem_cred_create();
 	}
 
-	while (fetchline(&src, &line))
+	while (fetchline(src, &line))
 	{
 		chunk_t ids, token;
+		key_type_t key_type;
 		shared_key_type_t type;
 
 		line_nr++;
@@ -849,10 +1133,8 @@ static void load_secrets(private_stroke_cred_t *this, char *file, int level,
 		{
 			continue;
 		}
-		if (line.len > strlen("include ") &&
-			strneq(line.ptr, "include ", strlen("include ")))
+		if (line.len > strlen("include ") && strpfx(line.ptr, "include "))
 		{
-			glob_t buf;
 			char **expanded, *dir, pattern[PATH_MAX];
 			u_char *pos;
 
@@ -881,8 +1163,7 @@ static void load_secrets(private_stroke_cred_t *this, char *file, int level,
 			}
 			else
 			{	/* use directory of current file if relative */
-				dir = strdup(file);
-				dir = dirname(dir);
+				dir = path_dirname(file);
 
 				if (line.len + 1 + strlen(dir) + 1 > sizeof(pattern))
 				{
@@ -894,22 +1175,32 @@ static void load_secrets(private_stroke_cred_t *this, char *file, int level,
 						 dir, (int)line.len, line.ptr);
 				free(dir);
 			}
-			if (glob(pattern, GLOB_ERR, NULL, &buf) != 0)
+#ifdef HAVE_GLOB_H
 			{
-				DBG1(DBG_CFG, "expanding file expression '%s' failed", pattern);
-			}
-			else
-			{
-				for (expanded = buf.gl_pathv; *expanded != NULL; expanded++)
+				glob_t buf;
+				if (glob(pattern, GLOB_ERR, NULL, &buf) != 0)
 				{
-					load_secrets(this, *expanded, level + 1, prompt);
+					DBG1(DBG_CFG, "expanding file expression '%s' failed",
+						 pattern);
 				}
+				else
+				{
+					for (expanded = buf.gl_pathv; *expanded != NULL; expanded++)
+					{
+						load_secrets(this, secrets, *expanded, level + 1,
+									 prompt);
+					}
+				}
+				globfree(&buf);
 			}
-			globfree(&buf);
+#else /* HAVE_GLOB_H */
+			/* if glob(3) is not available, try to load pattern directly */
+			load_secrets(this, secrets, pattern, level + 1, prompt);
+#endif /* HAVE_GLOB_H */
 			continue;
 		}
 
-		if (line.len > 2 && strneq(": ", line.ptr, 2))
+		if (line.len > 2 && strpfx(line.ptr, ": "))
 		{
 			/* no ids, skip the ':' */
 			ids = chunk_empty;
@@ -932,17 +1223,36 @@ static void load_secrets(private_stroke_cred_t *this, char *file, int level,
 			DBG1(DBG_CFG, "line %d: missing token", line_nr);
 			break;
 		}
-		if (match("RSA", &token) || match("ECDSA", &token))
+		if (match("RSA", &token) || match("ECDSA", &token) ||
+			match("BLISS", &token))
 		{
-			if (!load_private(this, line, line_nr, prompt,
-							  match("RSA", &token) ? KEY_RSA : KEY_ECDSA))
+			if (match("RSA", &token))
+			{
+				key_type = KEY_RSA;
+			}
+			else if (match("ECDSA", &token))
+			{
+				key_type = KEY_ECDSA;
+			}
+			else
+			{
+				key_type = KEY_BLISS;
+			}
+			if (!load_private(secrets, line, line_nr, prompt, key_type))
+			{
+				break;
+			}
+		}
+		else if (match("P12", &token))
+		{
+			if (!load_pkcs12(this, secrets, line, line_nr, prompt))
 			{
 				break;
 			}
 		}
 		else if (match("PIN", &token))
 		{
-			if (!load_pin(this, line, line_nr, prompt))
+			if (!load_pin(secrets, line, line_nr, prompt))
 			{
 				break;
 			}
@@ -952,20 +1262,25 @@ static void load_secrets(private_stroke_cred_t *this, char *file, int level,
 				 (match("NTLM", &token) && (type = SHARED_NT_HASH)) ||
 				 (match("XAUTH", &token) && (type = SHARED_EAP)))
 		{
-			if (!load_shared(this, line, line_nr, type, ids))
+			if (!load_shared(secrets, line, line_nr, type, ids))
 			{
 				break;
 			}
 		}
 		else
 		{
-			DBG1(DBG_CFG, "line %d: token must be either "
-				 "RSA, ECDSA, PSK, EAP, XAUTH or PIN", line_nr);
+			DBG1(DBG_CFG, "line %d: token must be either RSA, ECDSA, BLISS, "
+						  "P12, PIN, PSK, EAP, XAUTH or NTLM", line_nr);
 			break;
 		}
 	}
-	munmap(addr, sb.st_size);
-	close(fd);
+	chunk_unmap(src);
+
+	if (level == 0)
+	{	/* replace secrets in active credential set */
+		this->creds->replace_secrets(this->creds, secrets, FALSE);
+		secrets->destroy(secrets);
+	}
 }
 
 /**
@@ -994,15 +1309,13 @@ static void load_certs(private_stroke_cred_t *this)
 	load_certdir(this, CRL_DIR, CERT_X509_CRL, 0);
 }
 
-/**
- * Implementation of stroke_cred_t.reread.
- */
-static void reread(private_stroke_cred_t *this, stroke_msg_t *msg, FILE *prompt)
+METHOD(stroke_cred_t, reread, void,
+	private_stroke_cred_t *this, stroke_msg_t *msg, FILE *prompt)
 {
 	if (msg->reread.flags & REREAD_SECRETS)
 	{
 		DBG1(DBG_CFG, "rereading secrets");
-		load_secrets(this, SECRETS_FILE, 0, prompt);
+		load_secrets(this, NULL, this->secrets_file, 0, prompt);
 	}
 	if (msg->reread.flags & REREAD_CACERTS)
 	{
@@ -1037,10 +1350,14 @@ static void reread(private_stroke_cred_t *this, stroke_msg_t *msg, FILE *prompt)
 	}
 }
 
-/**
- * Implementation of stroke_cred_t.destroy
- */
-static void destroy(private_stroke_cred_t *this)
+METHOD(stroke_cred_t, add_shared, void,
+	private_stroke_cred_t *this, shared_key_t *shared, linked_list_t *owners)
+{
+	this->creds->add_shared_list(this->creds, shared, owners);
+}
+
+METHOD(stroke_cred_t, destroy, void,
+	private_stroke_cred_t *this)
 {
 	lib->credmgr->remove_set(lib->credmgr, &this->creds->set);
 	this->creds->destroy(this->creds);
@@ -1052,27 +1369,39 @@ static void destroy(private_stroke_cred_t *this)
  */
 stroke_cred_t *stroke_cred_create()
 {
-	private_stroke_cred_t *this = malloc_thing(private_stroke_cred_t);
+	private_stroke_cred_t *this;
 
-	this->public.set.create_private_enumerator = (void*)return_null;
-	this->public.set.create_cert_enumerator = (void*)return_null;
-	this->public.set.create_shared_enumerator = (void*)return_null;
-	this->public.set.create_cdp_enumerator = (void*)return_null;
-	this->public.set.cache_cert = (void*)cache_cert;
-	this->public.reread = (void(*)(stroke_cred_t*, stroke_msg_t *msg, FILE*))reread;
-	this->public.load_ca = (certificate_t*(*)(stroke_cred_t*, char *filename))load_ca;
-	this->public.load_peer = (certificate_t*(*)(stroke_cred_t*, char *filename))load_peer;
-	this->public.cachecrl = (void(*)(stroke_cred_t*, bool enabled))cachecrl;
-	this->public.destroy = (void(*)(stroke_cred_t*))destroy;
+	INIT(this,
+		.public = {
+			.set = {
+				.create_private_enumerator = (void*)return_null,
+				.create_cert_enumerator = (void*)return_null,
+				.create_shared_enumerator = (void*)return_null,
+				.create_cdp_enumerator = (void*)return_null,
+				.cache_cert = (void*)_cache_cert,
+			},
+			.reread = _reread,
+			.load_ca = _load_ca,
+			.load_peer = _load_peer,
+			.load_pubkey = _load_pubkey,
+			.add_shared = _add_shared,
+			.cachecrl = _cachecrl,
+			.destroy = _destroy,
+		},
+		.secrets_file = lib->settings->get_str(lib->settings,
+								"%s.plugins.stroke.secrets_file", SECRETS_FILE,
+								lib->ns),
+		.creds = mem_cred_create(),
+	);
 
-	this->creds = mem_cred_create();
 	lib->credmgr->add_set(lib->credmgr, &this->creds->set);
 
-	load_certs(this);
-	load_secrets(this, SECRETS_FILE, 0, NULL);
+	this->force_ca_cert = lib->settings->get_bool(lib->settings,
+						"%s.plugins.stroke.ignore_missing_ca_basic_constraint",
+						FALSE, lib->ns);
 
-	this->cachecrl = FALSE;
+	load_certs(this);
+	load_secrets(this, NULL, this->secrets_file, 0, NULL);
 
 	return &this->public;
 }
-

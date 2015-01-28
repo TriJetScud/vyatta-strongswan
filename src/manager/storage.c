@@ -37,10 +37,8 @@ struct private_storage_t {
 	database_t *db;
 };
 
-/**
- * Implementation of storage_t.login.
- */
-static int login(private_storage_t *this, char *username, char *password)
+METHOD(storage_t, login, int,
+	private_storage_t *this, char *username, char *password)
 {
 	hasher_t *hasher;
 	chunk_t hash, data, hex_str;
@@ -60,7 +58,11 @@ static int login(private_storage_t *this, char *username, char *password)
 	data = chunk_alloca(username_len + password_len);
 	memcpy(data.ptr, username, username_len);
 	memcpy(data.ptr + username_len, password, password_len);
-	hasher->get_hash(hasher, data, hash.ptr);
+	if (!hasher->get_hash(hasher, data, hash.ptr))
+	{
+		hasher->destroy(hasher);
+		return 0;
+	}
 	hasher->destroy(hasher);
 	hex_str = chunk_to_hex(hash, NULL, FALSE);
 
@@ -77,10 +79,8 @@ static int login(private_storage_t *this, char *username, char *password)
 	return uid;
 }
 
-/**
- * Implementation of storage_t.create_gateway_enumerator.
- */
-static enumerator_t* create_gateway_enumerator(private_storage_t *this, int user)
+METHOD(storage_t, create_gateway_enumerator, enumerator_t*,
+	private_storage_t *this, int user)
 {
 	enumerator_t *enumerator;
 
@@ -96,10 +96,8 @@ static enumerator_t* create_gateway_enumerator(private_storage_t *this, int user
 	return enumerator;
 }
 
-/**
- * Implementation of storage_t.destroy
- */
-static void destroy(private_storage_t *this)
+METHOD(storage_t, destroy, void,
+	private_storage_t *this)
 {
 	this->db->destroy(this->db);
 	free(this);
@@ -110,13 +108,16 @@ static void destroy(private_storage_t *this)
  */
 storage_t *storage_create(char *uri)
 {
-	private_storage_t *this = malloc_thing(private_storage_t);
+	private_storage_t *this;
 
-	this->public.login = (int(*)(storage_t*, char *username, char *password))login;
-	this->public.create_gateway_enumerator = (enumerator_t*(*)(storage_t*,int))create_gateway_enumerator;
-	this->public.destroy = (void(*)(storage_t*))destroy;
-
-	this->db = lib->db->create(lib->db, uri);
+	INIT(this,
+		.public = {
+			.login = _login,
+			.create_gateway_enumerator = _create_gateway_enumerator,
+			.destroy = _destroy,
+		},
+		.db = lib->db->create(lib->db, uri),
+	);
 	if (this->db == NULL)
 	{
 		free(this);

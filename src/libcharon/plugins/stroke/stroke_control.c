@@ -1,4 +1,5 @@
 /*
+ * Copyright (C) 2013 Tobias Brunner
  * Copyright (C) 2008 Martin Willi
  * Hochschule fuer Technik Rapperswil
  *
@@ -15,7 +16,9 @@
 
 #include "stroke_control.h"
 
+#include <hydra.h>
 #include <daemon.h>
+
 #include <processing/jobs/delete_ike_sa_job.h>
 #include <processing/jobs/rekey_ike_sa_job.h>
 #include <processing/jobs/rekey_child_sa_job.h>
@@ -31,6 +34,11 @@ struct private_stroke_control_t {
 	 * public functions
 	 */
 	stroke_control_t public;
+
+	/**
+	 * Timeout for stroke commands, im ms
+	 */
+	u_int timeout;
 };
 
 
@@ -56,11 +64,11 @@ struct stroke_log_info_t {
  * logging to the stroke interface
  */
 static bool stroke_log(stroke_log_info_t *info, debug_t group, level_t level,
-					   ike_sa_t *ike_sa, char *format, va_list args)
+					   ike_sa_t *ike_sa, char *message)
 {
 	if (level <= info->level)
 	{
-		if (vfprintf(info->out, format, args) < 0 ||
+		if (fprintf(info->out, "%s", message) < 0 ||
 			fprintf(info->out, "\n") < 0 ||
 			fflush(info->out) != 0)
 		{
@@ -95,20 +103,38 @@ static child_cfg_t* get_child_from_peer(peer_cfg_t *peer_cfg, char *name)
 /**
  * call the charon controller to initiate the connection
  */
-static void charon_initiate(peer_cfg_t *peer_cfg, child_cfg_t *child_cfg,
-							stroke_msg_t *msg, FILE *out)
+static void charon_initiate(private_stroke_control_t *this, peer_cfg_t *peer_cfg,
+							child_cfg_t *child_cfg, stroke_msg_t *msg, FILE *out)
 {
 	if (msg->output_verbosity < 0)
 	{
 		charon->controller->initiate(charon->controller, peer_cfg, child_cfg,
-									 NULL, NULL);
+									 NULL, NULL, 0);
 	}
 	else
 	{
 		stroke_log_info_t info = { msg->output_verbosity, out };
+		status_t status;
 
-		charon->controller->initiate(charon->controller, peer_cfg, child_cfg,
-									 (controller_cb_t)stroke_log, &info);
+		status = charon->controller->initiate(charon->controller,
+							peer_cfg, child_cfg, (controller_cb_t)stroke_log,
+							&info, this->timeout);
+		switch (status)
+		{
+			case SUCCESS:
+				fprintf(out, "connection '%s' established successfully\n",
+						msg->initiate.name);
+				break;
+			case OUT_OF_RES:
+				fprintf(out, "connection '%s' not established after %dms, "
+						"detaching\n", msg->initiate.name, this->timeout);
+				break;
+			default:
+			case FAILED:
+				fprintf(out, "establishing connection '%s' failed\n",
+						msg->initiate.name);
+				break;
+		}
 	}
 }
 
@@ -124,14 +150,6 @@ METHOD(stroke_control_t, initiate, void,
 													  msg->initiate.name);
 	if (peer_cfg)
 	{
-		if (peer_cfg->get_ike_version(peer_cfg) != 2)
-		{
-			DBG1(DBG_CFG, "ignoring initiation request for IKEv%d config",
-				 peer_cfg->get_ike_version(peer_cfg));
-			peer_cfg->destroy(peer_cfg);
-			return;
-		}
-
 		child_cfg = get_child_from_peer(peer_cfg, msg->initiate.name);
 		if (child_cfg == NULL)
 		{
@@ -139,7 +157,7 @@ METHOD(stroke_control_t, initiate, void,
 			while (enumerator->enumerate(enumerator, &child_cfg))
 			{
 				empty = FALSE;
-				charon_initiate(peer_cfg->get_ref(peer_cfg),
+				charon_initiate(this, peer_cfg->get_ref(peer_cfg),
 								child_cfg->get_ref(child_cfg), msg, out);
 			}
 			enumerator->destroy(enumerator);
@@ -155,14 +173,10 @@ METHOD(stroke_control_t, initiate, void,
 	}
 	else
 	{
-		enumerator = charon->backends->create_peer_cfg_enumerator(charon->backends,
-													NULL, NULL, NULL, NULL);
+		enumerator = charon->backends->create_peer_cfg_enumerator(
+							charon->backends, NULL, NULL, NULL, NULL, IKE_ANY);
 		while (enumerator->enumerate(enumerator, &peer_cfg))
 		{
-			if (peer_cfg->get_ike_version(peer_cfg) != 2)
-			{
-				continue;
-			}
 			child_cfg = get_child_from_peer(peer_cfg, msg->initiate.name);
 			if (child_cfg)
 			{
@@ -179,7 +193,7 @@ METHOD(stroke_control_t, initiate, void,
 			return;
 		}
 	}
-	charon_initiate(peer_cfg, child_cfg, msg, out);
+	charon_initiate(this, peer_cfg, child_cfg, msg, out);
 }
 
 /**
@@ -249,6 +263,41 @@ static bool parse_specifier(char *string, u_int32_t *id,
 	return TRUE;
 }
 
+/**
+ * Report the result of a terminate() call to console
+ */
+static void report_terminate_status(private_stroke_control_t *this,
+						status_t status, FILE *out, u_int32_t id, bool child)
+{
+	char *prefix, *postfix;
+
+	if (child)
+	{
+		prefix = "CHILD_SA {";
+		postfix = "}";
+	}
+	else
+	{
+		prefix = "IKE_SA [";
+		postfix = "]";
+	}
+
+	switch (status)
+	{
+		case SUCCESS:
+			fprintf(out, "%s%d%s closed successfully\n", prefix, id, postfix);
+			break;
+		case OUT_OF_RES:
+			fprintf(out, "%s%d%s not closed after %dms, detaching\n",
+					prefix, id, postfix, this->timeout);
+			break;
+		default:
+		case FAILED:
+			fprintf(out, "closing %s%d%s failed\n", prefix, id, postfix);
+			break;
+	}
+}
+
 METHOD(stroke_control_t, terminate, void,
 	private_stroke_control_t *this, stroke_msg_t *msg, FILE *out)
 {
@@ -260,6 +309,7 @@ METHOD(stroke_control_t, terminate, void,
 	linked_list_t *ike_list, *child_list;
 	stroke_log_info_t info;
 	uintptr_t del;
+	status_t status;
 
 	if (!parse_specifier(msg->terminate.name, &id, &name, &child, &all))
 	{
@@ -274,29 +324,30 @@ METHOD(stroke_control_t, terminate, void,
 	{
 		if (child)
 		{
-			charon->controller->terminate_child(charon->controller, id,
-									(controller_cb_t)stroke_log, &info);
+			status = charon->controller->terminate_child(charon->controller, id,
+							(controller_cb_t)stroke_log, &info, this->timeout);
 		}
 		else
 		{
-			charon->controller->terminate_ike(charon->controller, id,
-									(controller_cb_t)stroke_log, &info);
+			status = charon->controller->terminate_ike(charon->controller, id,
+							(controller_cb_t)stroke_log, &info, this->timeout);
 		}
-		return;
+		return report_terminate_status(this, status, out, id, child);
 	}
 
 	ike_list = linked_list_create();
 	child_list = linked_list_create();
-	enumerator = charon->controller->create_ike_sa_enumerator(charon->controller);
+	enumerator = charon->controller->create_ike_sa_enumerator(
+													charon->controller, TRUE);
 	while (enumerator->enumerate(enumerator, &ike_sa))
 	{
 		child_sa_t *child_sa;
-		iterator_t *children;
+		enumerator_t *children;
 
 		if (child)
 		{
-			children = ike_sa->create_child_sa_iterator(ike_sa);
-			while (children->iterate(children, (void**)&child_sa))
+			children = ike_sa->create_child_sa_enumerator(ike_sa);
+			while (children->enumerate(children, (void**)&child_sa))
 			{
 				if (streq(name, child_sa->get_name(child_sa)))
 				{
@@ -329,16 +380,18 @@ METHOD(stroke_control_t, terminate, void,
 	enumerator = child_list->create_enumerator(child_list);
 	while (enumerator->enumerate(enumerator, &del))
 	{
-		charon->controller->terminate_child(charon->controller, del,
-									(controller_cb_t)stroke_log, &info);
+		status = charon->controller->terminate_child(charon->controller, del,
+							(controller_cb_t)stroke_log, &info, this->timeout);
+		report_terminate_status(this, status, out, del, TRUE);
 	}
 	enumerator->destroy(enumerator);
 
 	enumerator = ike_list->create_enumerator(ike_list);
 	while (enumerator->enumerate(enumerator, &del))
 	{
-		charon->controller->terminate_ike(charon->controller, del,
-									(controller_cb_t)stroke_log, &info);
+		status = charon->controller->terminate_ike(charon->controller, del,
+							(controller_cb_t)stroke_log, &info, this->timeout);
+		report_terminate_status(this, status, out, del, FALSE);
 	}
 	enumerator->destroy(enumerator);
 
@@ -366,16 +419,17 @@ METHOD(stroke_control_t, rekey, void,
 		DBG1(DBG_CFG, "error parsing specifier string");
 		return;
 	}
-	enumerator = charon->controller->create_ike_sa_enumerator(charon->controller);
+	enumerator = charon->controller->create_ike_sa_enumerator(
+													charon->controller, TRUE);
 	while (enumerator->enumerate(enumerator, &ike_sa))
 	{
 		child_sa_t *child_sa;
-		iterator_t *children;
+		enumerator_t *children;
 
 		if (child)
 		{
-			children = ike_sa->create_child_sa_iterator(ike_sa);
-			while (children->iterate(children, (void**)&child_sa))
+			children = ike_sa->create_child_sa_enumerator(ike_sa);
+			while (children->enumerate(children, (void**)&child_sa))
 			{
 				if ((name && streq(name, child_sa->get_name(child_sa))) ||
 					(id && id == child_sa->get_reqid(child_sa)))
@@ -415,10 +469,10 @@ METHOD(stroke_control_t, rekey, void,
 METHOD(stroke_control_t, terminate_srcip, void,
 	private_stroke_control_t *this, stroke_msg_t *msg, FILE *out)
 {
-	enumerator_t *enumerator;
+	enumerator_t *enumerator, *vips;
 	ike_sa_t *ike_sa;
 	host_t *start = NULL, *end = NULL, *vip;
-	chunk_t chunk_start, chunk_end = chunk_empty, chunk_vip;
+	chunk_t chunk_start, chunk_end = chunk_empty, chunk;
 
 	if (msg->terminate_srcip.start)
 	{
@@ -442,36 +496,44 @@ METHOD(stroke_control_t, terminate_srcip, void,
 		chunk_end = end->get_address(end);
 	}
 
-	enumerator = charon->controller->create_ike_sa_enumerator(charon->controller);
+	enumerator = charon->controller->create_ike_sa_enumerator(
+													charon->controller, TRUE);
 	while (enumerator->enumerate(enumerator, &ike_sa))
 	{
-		vip = ike_sa->get_virtual_ip(ike_sa, FALSE);
-		if (!vip)
-		{
-			continue;
-		}
-		if (!end)
-		{
-			if (!vip->ip_equals(vip, start))
-			{
-				continue;
-			}
-		}
-		else
-		{
-			chunk_vip = vip->get_address(vip);
-			if (chunk_vip.len != chunk_start.len ||
-				chunk_vip.len != chunk_end.len ||
-				memcmp(chunk_vip.ptr, chunk_start.ptr, chunk_vip.len) < 0 ||
-				memcmp(chunk_vip.ptr, chunk_end.ptr, chunk_vip.len) > 0)
-			{
-				continue;
-			}
-		}
+		bool match = FALSE;
 
-		/* schedule delete asynchronously */
-		lib->processor->queue_job(lib->processor, (job_t*)
+		vips = ike_sa->create_virtual_ip_enumerator(ike_sa, FALSE);
+		while (vips->enumerate(vips, &vip))
+		{
+			if (!end)
+			{
+				if (vip->ip_equals(vip, start))
+				{
+					match = TRUE;
+					break;
+				}
+			}
+			else
+			{
+				chunk = vip->get_address(vip);
+				if (chunk.len == chunk_start.len &&
+					chunk.len == chunk_end.len &&
+					memcmp(chunk.ptr, chunk_start.ptr, chunk.len) >= 0 &&
+					memcmp(chunk.ptr, chunk_end.ptr, chunk.len) <= 0)
+				{
+					match = TRUE;
+					break;
+				}
+			}
+		}
+		vips->destroy(vips);
+
+		if (match)
+		{
+			/* schedule delete asynchronously */
+			lib->processor->queue_job(lib->processor, (job_t*)
 						delete_ike_sa_job_create(ike_sa->get_id(ike_sa), TRUE));
+		}
 	}
 	enumerator->destroy(enumerator);
 	start->destroy(start);
@@ -481,54 +543,118 @@ METHOD(stroke_control_t, terminate_srcip, void,
 METHOD(stroke_control_t, purge_ike, void,
 	private_stroke_control_t *this, stroke_msg_t *msg, FILE *out)
 {
-	enumerator_t *enumerator;
-	iterator_t *iterator;
+	enumerator_t *enumerator, *children;
 	ike_sa_t *ike_sa;
 	child_sa_t *child_sa;
 	linked_list_t *list;
 	uintptr_t del;
 	stroke_log_info_t info;
+	status_t status;
 
 	info.out = out;
 	info.level = msg->output_verbosity;
 
 	list = linked_list_create();
-	enumerator = charon->controller->create_ike_sa_enumerator(charon->controller);
+	enumerator = charon->controller->create_ike_sa_enumerator(
+													charon->controller, TRUE);
 	while (enumerator->enumerate(enumerator, &ike_sa))
 	{
-		iterator = ike_sa->create_child_sa_iterator(ike_sa);
-		if (!iterator->iterate(iterator, (void**)&child_sa))
+		children = ike_sa->create_child_sa_enumerator(ike_sa);
+		if (!children->enumerate(children, (void**)&child_sa))
 		{
 			list->insert_last(list,
 						(void*)(uintptr_t)ike_sa->get_unique_id(ike_sa));
 		}
-		iterator->destroy(iterator);
+		children->destroy(children);
 	}
 	enumerator->destroy(enumerator);
 
 	enumerator = list->create_enumerator(list);
 	while (enumerator->enumerate(enumerator, &del))
 	{
-		charon->controller->terminate_ike(charon->controller, del,
-									(controller_cb_t)stroke_log, &info);
+		status = charon->controller->terminate_ike(charon->controller, del,
+							(controller_cb_t)stroke_log, &info, this->timeout);
+		report_terminate_status(this, status, out, del, TRUE);
 	}
 	enumerator->destroy(enumerator);
 	list->destroy(list);
 }
 
 /**
- * call charon to install a trap
+ * Find an existing CHILD_SA/reqid
+ */
+static u_int32_t find_reqid(child_cfg_t *child_cfg)
+{
+	enumerator_t *enumerator, *children;
+	child_sa_t *child_sa;
+	ike_sa_t *ike_sa;
+	char *name;
+	u_int32_t reqid;
+
+	reqid = charon->traps->find_reqid(charon->traps, child_cfg);
+	if (reqid)
+	{	/* already trapped */
+		return reqid;
+	}
+
+	name = child_cfg->get_name(child_cfg);
+	enumerator = charon->controller->create_ike_sa_enumerator(
+													charon->controller, TRUE);
+	while (enumerator->enumerate(enumerator, &ike_sa))
+	{
+		children = ike_sa->create_child_sa_enumerator(ike_sa);
+		while (children->enumerate(children, (void**)&child_sa))
+		{
+			if (streq(name, child_sa->get_name(child_sa)))
+			{
+				reqid = child_sa->get_reqid(child_sa);
+				break;
+			}
+		}
+		children->destroy(children);
+		if (reqid)
+		{
+			break;
+		}
+	}
+	enumerator->destroy(enumerator);
+	return reqid;
+}
+
+/**
+ * call charon to install a shunt or trap
  */
 static void charon_route(peer_cfg_t *peer_cfg, child_cfg_t *child_cfg,
 						 char *name, FILE *out)
 {
-	if (charon->traps->install(charon->traps, peer_cfg, child_cfg))
+	ipsec_mode_t mode;
+	u_int32_t reqid;
+
+	mode = child_cfg->get_mode(child_cfg);
+	if (mode == MODE_PASS || mode == MODE_DROP)
 	{
-		fprintf(out, "'%s' routed\n", name);
+		if (charon->shunts->install(charon->shunts, child_cfg))
+		{
+			fprintf(out, "'%s' shunt %N policy installed\n",
+					name, ipsec_mode_names, mode);
+		}
+		else
+		{
+			fprintf(out, "'%s' shunt %N policy installation failed\n",
+					name, ipsec_mode_names, mode);
+		}
 	}
 	else
 	{
-		fprintf(out, "routing '%s' failed\n", name);
+		reqid = find_reqid(child_cfg);
+		if (charon->traps->install(charon->traps, peer_cfg, child_cfg, reqid))
+		{
+			fprintf(out, "'%s' routed\n", name);
+		}
+		else
+		{
+			fprintf(out, "routing '%s' failed\n", name);
+		}
 	}
 }
 
@@ -544,14 +670,6 @@ METHOD(stroke_control_t, route, void,
 													  msg->route.name);
 	if (peer_cfg)
 	{
-		if (peer_cfg->get_ike_version(peer_cfg) != 2)
-		{
-			DBG1(DBG_CFG, "ignoring initiation request for IKEv%d config",
-				 peer_cfg->get_ike_version(peer_cfg));
-			peer_cfg->destroy(peer_cfg);
-			return;
-		}
-
 		child_cfg = get_child_from_peer(peer_cfg, msg->route.name);
 		if (child_cfg == NULL)
 		{
@@ -575,14 +693,10 @@ METHOD(stroke_control_t, route, void,
 	}
 	else
 	{
-		enumerator = charon->backends->create_peer_cfg_enumerator(charon->backends,
-													NULL, NULL, NULL, NULL);
+		enumerator = charon->backends->create_peer_cfg_enumerator(
+							charon->backends, NULL, NULL, NULL, NULL, IKE_ANY);
 		while (enumerator->enumerate(enumerator, &peer_cfg))
 		{
-			if (peer_cfg->get_ike_version(peer_cfg) != 2)
-			{
-				continue;
-			}
 			child_cfg = get_child_from_peer(peer_cfg, msg->route.name);
 			if (child_cfg)
 			{
@@ -609,7 +723,13 @@ METHOD(stroke_control_t, unroute, void,
 {
 	child_sa_t *child_sa;
 	enumerator_t *enumerator;
-	u_int32_t id;
+	u_int32_t id = 0;
+
+	if (charon->shunts->uninstall(charon->shunts, msg->unroute.name))
+	{
+		fprintf(out, "shunt policy '%s' uninstalled\n", msg->unroute.name);
+		return;
+	}
 
 	enumerator = charon->traps->create_enumerator(charon->traps);
 	while (enumerator->enumerate(enumerator, NULL, &child_sa))
@@ -617,14 +737,20 @@ METHOD(stroke_control_t, unroute, void,
 		if (streq(msg->unroute.name, child_sa->get_name(child_sa)))
 		{
 			id = child_sa->get_reqid(child_sa);
-			enumerator->destroy(enumerator);
-			charon->traps->uninstall(charon->traps, id);
-			fprintf(out, "configuration '%s' unrouted\n", msg->unroute.name);
-			return;
+			break;
 		}
 	}
 	enumerator->destroy(enumerator);
-	fprintf(out, "configuration '%s' not found\n", msg->unroute.name);
+
+	if (id)
+	{
+		charon->traps->uninstall(charon->traps, id);
+		fprintf(out, "configuration '%s' unrouted\n", msg->unroute.name);
+	}
+	else
+	{
+		fprintf(out, "configuration '%s' not found\n", msg->unroute.name);
+	}
 }
 
 METHOD(stroke_control_t, destroy, void,
@@ -651,8 +777,9 @@ stroke_control_t *stroke_control_create()
 			.unroute = _unroute,
 			.destroy = _destroy,
 		},
+		.timeout = lib->settings->get_int(lib->settings,
+									"%s.plugins.stroke.timeout", 0, lib->ns),
 	);
 
 	return &this->public;
 }
-

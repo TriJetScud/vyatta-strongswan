@@ -1,7 +1,20 @@
+/*
+ * Copyright (C) 2010 Martin Willi
+ * Copyright (C) 2010 revosec AG
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2 of the License, or (at your
+ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * for more details.
+ */
 
 #include <stdio.h>
 #include <library.h>
-#include <crypto/proposal/proposal_keywords.h>
 
 int main(int argc, char *argv[])
 {
@@ -13,8 +26,8 @@ int main(int argc, char *argv[])
 	int i = 0, limit = 0;
 
 
-	library_init(NULL);
-	lib->plugins->load(lib->plugins, NULL, PLUGINS);
+	library_init(NULL, "crypt_burn");
+	lib->plugins->load(lib->plugins, PLUGINS);
 	atexit(library_deinit);
 
 	printf("loaded: %s\n", PLUGINS);
@@ -33,7 +46,7 @@ int main(int argc, char *argv[])
 		limit = atoi(argv[2]);
 	}
 
-	token = proposal_get_token(argv[1], strlen(argv[1]));
+	token = lib->proposal->get_token(lib->proposal, argv[1]);
 	if (!token)
 	{
 		fprintf(stderr, "algorithm '%s' unknown!\n", argv[1]);
@@ -48,7 +61,7 @@ int main(int argc, char *argv[])
 	if (encryption_algorithm_is_aead(token->algorithm))
 	{
 		aead = lib->crypto->create_aead(lib->crypto,
-										token->algorithm, token->keysize / 8);
+									token->algorithm, token->keysize / 8, 0);
 		if (!aead)
 		{
 			fprintf(stderr, "aead '%s' not supported!\n", argv[1]);
@@ -56,22 +69,27 @@ int main(int argc, char *argv[])
 		}
 		while (TRUE)
 		{
-			aead->encrypt(aead,
+			if (!aead->encrypt(aead,
 				chunk_create(buffer, sizeof(buffer) - aead->get_icv_size(aead)),
 				chunk_from_thing(assoc),
-				chunk_create(iv, aead->get_iv_size(aead)), NULL);
+				chunk_create(iv, aead->get_iv_size(aead)), NULL))
+			{
+				fprintf(stderr, "aead encryption failed!\n");
+				return 1;
+			}
 			if (!aead->decrypt(aead, chunk_create(buffer, sizeof(buffer)),
 				chunk_from_thing(assoc),
 				chunk_create(iv, aead->get_iv_size(aead)), NULL))
 			{
 				fprintf(stderr, "aead integrity check failed!\n");
-				return FALSE;
+				return 1;
 			}
 			if (limit && ++i == limit)
 			{
 				break;
 			}
 		}
+		aead->destroy(aead);
 	}
 	else
 	{
@@ -84,19 +102,26 @@ int main(int argc, char *argv[])
 		}
 		bs = crypter->get_block_size(crypter);
 
-		while (i--)
+		while (TRUE)
 		{
-			crypter->encrypt(crypter,
-				chunk_create(buffer, sizeof(buffer) / bs * bs),
-				chunk_create(iv, crypter->get_iv_size(crypter)), NULL);
-			crypter->decrypt(crypter,
-				chunk_create(buffer, sizeof(buffer) / bs * bs),
-				chunk_create(iv, crypter->get_iv_size(crypter)), NULL);
+			if (!crypter->encrypt(crypter,
+					chunk_create(buffer, sizeof(buffer) / bs * bs),
+					chunk_create(iv, crypter->get_iv_size(crypter)), NULL))
+			{
+				continue;
+			}
+			if (!crypter->decrypt(crypter,
+					chunk_create(buffer, sizeof(buffer) / bs * bs),
+					chunk_create(iv, crypter->get_iv_size(crypter)), NULL))
+			{
+				continue;
+			}
 			if (limit && ++i == limit)
 			{
 				break;
 			}
 		}
+		crypter->destroy(crypter);
 	}
 	return 0;
 }

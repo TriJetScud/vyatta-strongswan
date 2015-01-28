@@ -22,9 +22,10 @@
 #define CREDENTIAL_MANAGER_H_
 
 typedef struct credential_manager_t credential_manager_t;
+typedef enum credential_hook_type_t credential_hook_type_t;
 
 #include <utils/identification.h>
-#include <utils/enumerator.h>
+#include <collections/enumerator.h>
 #include <credentials/auth_cfg.h>
 #include <credentials/credential_set.h>
 #include <credentials/keys/private_key.h>
@@ -33,14 +34,45 @@ typedef struct credential_manager_t credential_manager_t;
 #include <credentials/cert_validator.h>
 
 /**
+ * Type of a credential hook error/event.
+ */
+enum credential_hook_type_t {
+	/** The certificate has expired (or is not yet valid) */
+	CRED_HOOK_EXPIRED,
+	/** The certificate has been revoked */
+	CRED_HOOK_REVOKED,
+	/** Checking certificate revocation failed. This does not necessarily mean
+	 *  the certificate is rejected, just that revocation checking failed. */
+	CRED_HOOK_VALIDATION_FAILED,
+	/** No trusted issuer certificate has been found for this certificate */
+	CRED_HOOK_NO_ISSUER,
+	/** Encountered a self-signed (root) certificate, but it is not trusted */
+	CRED_HOOK_UNTRUSTED_ROOT,
+	/** Maximum trust chain length exceeded for certificate */
+	CRED_HOOK_EXCEEDED_PATH_LEN,
+	/** The certificate violates some other kind of policy and gets rejected */
+	CRED_HOOK_POLICY_VIOLATION,
+};
+
+/**
+ * Hook function to invoke on certificate validation errors.
+ *
+ * @param data			user data supplied during hook registration
+ * @param type			type of validation error/event
+ * @param cert			associated certificate
+ */
+typedef void (*credential_hook_t)(void *data, credential_hook_type_t type,
+								  certificate_t *cert);
+
+/**
  * Manages credentials using credential_sets.
  *
  * The credential manager is the entry point of the credential framework. It
- * uses so called "sets" to access credentials in a modular fashion, these
+ * uses so called "sets" to access credentials in a modular fashion. These
  * are implemented through the credential_set_t interface.
  * The manager additionally does trust chain verification and trust status
- * chaching. A set may call the managers methods if it needs credentials itself,
- * the manager uses recursive locking.
+ * caching. A set may call the managers methods if it needs credentials itself.
+ * The manager uses recursive locking.
  *
  * @verbatim
 
@@ -62,8 +94,8 @@ typedef struct credential_manager_t credential_manager_t;
 
    @endverbatim
  *
- * The credential manager uses rwlocks for performance reasons, credential
- * sets must be fully thread save.
+ * The credential manager uses rwlocks for performance reasons. Credential
+ * sets must be fully thread-safe.
  */
 struct credential_manager_t {
 
@@ -84,12 +116,12 @@ struct credential_manager_t {
 	 *
 	 * The enumerator enumerates over:
 	 *  shared_key_t*, id_match_t me, id_match_t other
-	 * But must accepts values for the id_matches.
+	 * But must accept values for the id_matches.
 	 *
 	 * @param type		kind of requested shared key
 	 * @param first		first subject between key is shared
 	 * @param second	second subject between key is shared
-	 * @return			enumerator over shared keys
+	 * @return			enumerator over (shared_key_t*,id_match_t,id_match_t)
 	 */
 	enumerator_t *(*create_shared_enumerator)(credential_manager_t *this,
 								shared_key_type_t type,
@@ -120,7 +152,7 @@ struct credential_manager_t {
 	 *
 	 * @param type		kind of requested shared key
 	 * @param me		own identity
-	 * @param other		peers identity
+	 * @param other		peer identity
 	 * @return			shared_key_t, NULL if none found
 	 */
 	shared_key_t *(*get_shared)(credential_manager_t *this, shared_key_type_t type,
@@ -130,7 +162,7 @@ struct credential_manager_t {
 	 *
 	 * The get_private() method gets a secret private key identified by either
 	 * the keyid itself or an id the key belongs to.
-	 * The auth parameter contains additional information, such as receipients
+	 * The auth parameter contains additional information, such as recipients
 	 * trusted CA certs. Auth gets filled with subject and CA certificates
 	 * needed to validate a created signature.
 	 *
@@ -146,7 +178,7 @@ struct credential_manager_t {
 	 * Create an enumerator over trusted certificates.
 	 *
 	 * This method creates an enumerator over trusted certificates. The auth
-	 * parameter (if given) recevies the trustchain used to validate
+	 * parameter (if given) receives the trustchain used to validate
 	 * the certificate. The resulting enumerator enumerates over
 	 * certificate_t*, auth_cfg_t*.
 	 * If online is set, revocations are checked online for the whole
@@ -163,7 +195,7 @@ struct credential_manager_t {
 	/**
 	 * Create an enumerator over trusted public keys.
 	 *
-	 * This method gets a an enumerator over trusted public keys to verify a
+	 * This method creates an enumerator over trusted public keys to verify a
 	 * signature created by id. The auth parameter contains additional
 	 * authentication infos, e.g. peer and intermediate certificates.
 	 * The resulting enumerator enumerates over public_key_t *, auth_cfg_t *,
@@ -180,7 +212,7 @@ struct credential_manager_t {
 					key_type_t type, identification_t *id, auth_cfg_t *auth);
 
 	/**
-	 * Cache a certificate by invoking cache_cert() on all registerd sets.
+	 * Cache a certificate by invoking cache_cert() on all registered sets.
 	 *
 	 * @param cert		certificate to cache
 	 */
@@ -199,15 +231,17 @@ struct credential_manager_t {
 	/**
 	 * Check if a given subject certificate is issued by an issuer certificate.
 	 *
-	 * This operation does signature verification, but uses the credential
-	 * managers cache for to speed up the operation.
+	 * This operation does signature verification using the credential
+	 * manager's cache to speed up the operation.
 	 *
 	 * @param subject	subject certificate to check
 	 * @param issuer	issuer certificate that potentially has signed subject
+	 * @param scheme	receives used signature scheme, if given
 	 * @return			TRUE if issuer signed subject
 	 */
 	bool (*issued_by)(credential_manager_t *this,
-					  certificate_t *subject, certificate_t *issuer);
+					  certificate_t *subject, certificate_t *issuer,
+					  signature_scheme_t *scheme);
 
 	/**
 	 * Register a credential set to the manager.
@@ -228,12 +262,16 @@ struct credential_manager_t {
 	 *
 	 * To add a credential set for the current trustchain verification
 	 * operation, sets may be added for the calling thread only. This
-	 * does not require a write lock and is therefore a much less expensive
+	 * does not require a write lock and is therefore a much cheaper
 	 * operation.
+	 * The exclusive option allows to disable all other credential sets
+	 * until the set is deregistered.
 	 *
 	 * @param set		set to register
+	 * @param exclusive	TRUE to disable all other sets for this thread
 	 */
-	void (*add_local_set)(credential_manager_t *this, credential_set_t *set);
+	void (*add_local_set)(credential_manager_t *this, credential_set_t *set,
+						  bool exclusive);
 
 	/**
 	 * Unregister a thread local credential set from the manager.
@@ -255,6 +293,28 @@ struct credential_manager_t {
 	 * @param vdtr		validator to unregister
 	 */
 	void (*remove_validator)(credential_manager_t *this, cert_validator_t *vdtr);
+
+	/**
+	 * Set a hook to call on certain credential validation errors.
+	 *
+	 * @param hook		hook to register, NULL to unregister
+	 * @param data		data to pass to hook
+	 */
+	void (*set_hook)(credential_manager_t *this, credential_hook_t hook,
+					 void *data);
+
+	/**
+	 * Call the registered credential hook, if any.
+	 *
+	 * While hooks are usually called by the credential manager itself, some
+	 * validator plugins might raise hooks as well if they consider certificates
+	 * invalid.
+	 *
+	 * @param type		type of the event
+	 * @param cert		associated certificate
+	 */
+	void (*call_hook)(credential_manager_t *this, credential_hook_type_t type,
+					  certificate_t *cert);
 
 	/**
 	 * Destroy a credential_manager instance.

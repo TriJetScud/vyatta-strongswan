@@ -15,7 +15,7 @@
 
 #include "dumm.h"
 
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -479,7 +479,7 @@ int main(int argc, char *argv[])
 	enumerator_t *enumerator;
 	guest_t *guest;
 
-	library_init(NULL);
+	library_init(NULL, "dumm");
 	gtk_init(&argc, &argv);
 
 	pages = linked_list_create();

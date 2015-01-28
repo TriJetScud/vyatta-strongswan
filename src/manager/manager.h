@@ -16,7 +16,7 @@
 /**
  * @defgroup manager manager
  *
- * @defgroup controller controller
+ * @defgroup manager_controller controller
  * @ingroup manager
  *
  * @defgroup manager_i manager
@@ -29,9 +29,7 @@
 #include "storage.h"
 #include "gateway.h"
 
-#include <context.h>
-
-#include <utils/iterator.h>
+#include <fast_context.h>
 
 typedef struct manager_t manager_t;
 
@@ -43,10 +41,10 @@ struct manager_t {
 	/**
 	 * implements context_t interface
 	 */
-	context_t context;
+	fast_context_t context;
 
 	/**
-	 * Create an iterator over all configured gateways.
+	 * Create an enumerator over all configured gateways.
 	 *
 	 * enumerate() arguments: int id, char *name, int port, char *address
 	 * If port is 0, address is a Unix socket address.

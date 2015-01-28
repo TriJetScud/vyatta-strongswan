@@ -8,14 +8,16 @@ charon.c
 # build charon -----------------------------------------------------------------
 
 LOCAL_C_INCLUDES += \
-	$(libvstr_PATH) \
 	$(strongswan_PATH)/src/libhydra \
 	$(strongswan_PATH)/src/libcharon \
 	$(strongswan_PATH)/src/libstrongswan
 
-LOCAL_CFLAGS := $(strongswan_CFLAGS)
+LOCAL_CFLAGS := $(strongswan_CFLAGS) \
+	-DPLUGINS='"$(strongswan_CHARON_PLUGINS)"'
 
 LOCAL_MODULE := charon
+
+LOCAL_MODULE_TAGS := optional
 
 LOCAL_ARM_MODE := arm
 

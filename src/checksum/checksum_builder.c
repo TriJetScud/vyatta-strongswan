@@ -19,10 +19,9 @@
 #include <dlfcn.h>
 
 #include <library.h>
-#include <utils/enumerator.h>
-
-/* we need to fake the pluto symbol to dlopen() the xauth plugin */
-void *pluto;
+#include <hydra.h>
+#include <daemon.h>
+#include <collections/enumerator.h>
 
 /**
  * Integrity checker
@@ -62,16 +61,16 @@ static void build_checksum(char *path, char *name, char *sname)
 			fprintf(stderr, "dlopen failed: %s\n", dlerror());
 		}
 	}
-	printf("\t{\"%-20s%7u, 0x%08x, %6u, 0x%08x},\n",
+	printf("\t{\"%-25s%7u, 0x%08x, %6u, 0x%08x},\n",
 		   name, fsize, fsum, ssize, ssum);
-	fprintf(stderr, "\"%-20s%7u / 0x%08x       %6u / 0x%08x\n",
+	fprintf(stderr, "\"%-25s%7u / 0x%08x       %6u / 0x%08x\n",
 			name, fsize, fsum, ssize, ssum);
 }
 
 /**
- * Build checksums for a set of plugins in a given path prefix
+ * Build checksums for a set of plugins
  */
-static void build_plugin_checksums(char *plugins, char *prefix)
+static void build_plugin_checksums(char *plugins)
 {
 	enumerator_t *enumerator;
 	char *plugin, path[256], under[128], sname[128], name[128];
@@ -81,8 +80,8 @@ static void build_plugin_checksums(char *plugins, char *prefix)
 	{
 		snprintf(under, sizeof(under), "%s", plugin);
 		translate(under, "-", "_");
-		snprintf(path, sizeof(path), "%s/%s/.libs/libstrongswan-%s.so",
-				 prefix, under, plugin);
+		snprintf(path, sizeof(path), "%s/libstrongswan-%s.so",
+				 PLUGINDIR, plugin);
 		snprintf(sname, sizeof(sname), "%s_plugin_create", under);
 		snprintf(name, sizeof(name), "%s\",", plugin);
 		build_checksum(path, name, sname);
@@ -104,14 +103,16 @@ static void build_binary_checksum(char *path)
 		pos = strrchr(binary, '.');
 		if (pos && streq(pos, ".so"))
 		{
-			snprintf(name, sizeof(name), "%.*s\",", pos - binary, binary);
+			snprintf(name, sizeof(name), "%.*s\",", (int)(pos - binary),
+					 binary);
 			if (streq(name, "libstrongswan\","))
 			{
 				snprintf(sname, sizeof(sname), "%s", "library_init");
 			}
 			else
 			{
-				snprintf(sname, sizeof(sname), "%.*s_init", pos - binary, binary);
+				snprintf(sname, sizeof(sname), "%.*s_init", (int)(pos - binary),
+						 binary);
 			}
 			build_checksum(path, name, sname);
 		}
@@ -127,9 +128,15 @@ int main(int argc, char* argv[])
 {
 	int i;
 
+	/* forces link against libhydra/libcharon, imports symbols needed to
+	 * dlopen plugins */
+	hydra = NULL;
+	charon = NULL;
+
 	/* avoid confusing leak reports in build process */
 	setenv("LEAK_DETECTIVE_DISABLE", "1", 0);
-	library_init(NULL);
+	/* don't use a strongswan.conf, forces integrity check to disabled */
+	library_init("", "checksum_builder");
 	atexit(library_deinit);
 
 	integrity = integrity_checker_create(NULL);
@@ -143,15 +150,24 @@ int main(int argc, char* argv[])
 	printf("\n");
 	printf("integrity_checksum_t checksums[] = {\n");
 	fprintf(stderr, "integrity test data:\n");
-	fprintf(stderr, "module name,       file size / checksum   segment size / checksum\n");
+	fprintf(stderr, "module name,            file size / checksum   "
+					"segment size / checksum\n");
 	for (i = 1; i < argc; i++)
 	{
 		build_binary_checksum(argv[i]);
 	}
-	build_plugin_checksums(S_PLUGINS, S_PATH);
-	build_plugin_checksums(H_PLUGINS, H_PATH);
-	build_plugin_checksums(P_PLUGINS, P_PATH);
-	build_plugin_checksums(C_PLUGINS, C_PATH);
+#ifdef S_PLUGINS
+	build_plugin_checksums(S_PLUGINS);
+#endif
+#ifdef H_PLUGINS
+	build_plugin_checksums(H_PLUGINS);
+#endif
+#ifdef T_PLUGINS
+	build_plugin_checksums(T_PLUGINS);
+#endif
+#ifdef C_PLUGINS
+	build_plugin_checksums(C_PLUGINS);
+#endif
 
 	printf("};\n");
 	printf("\n");

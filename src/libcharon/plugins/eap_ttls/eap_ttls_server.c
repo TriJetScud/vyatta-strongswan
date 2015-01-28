@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010 Andreas Steffen
- * Copyright (C) 2010 HSR Hochschule fuer Technik Rapperswil
+ * Copyright (C) 2010-2014 Andreas Steffen
+ * HSR Hochschule fuer Technik Rapperswil
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -16,10 +16,11 @@
 #include "eap_ttls_server.h"
 #include "eap_ttls_avp.h"
 
-#include <debug.h>
+#include <utils/debug.h>
 #include <daemon.h>
 
-#include <sa/authenticators/eap/eap_method.h>
+#include <sa/eap/eap_method.h>
+#include <sa/eap/eap_inner_method.h>
 
 typedef struct private_eap_ttls_server_t private_eap_ttls_server_t;
 
@@ -78,7 +79,8 @@ static status_t start_phase2_auth(private_eap_ttls_server_t *this)
 	eap_type_t type;
 
 	eap_type_str = lib->settings->get_str(lib->settings,
-					 	"charon.plugins.eap-ttls.phase2_method", "md5");
+									"%s.plugins.eap-ttls.phase2_method", "md5",
+									lib->ns);
 	type = eap_type_from_string(eap_type_str);
 	if (type == 0)
 	{
@@ -105,21 +107,39 @@ static status_t start_phase2_auth(private_eap_ttls_server_t *this)
 }
 
 /**
- * If configured, start EAP-TNC protocol
+ * If configured, start PT-EAP or legacy EAP-TNC protocol
  */
-static status_t start_phase2_tnc(private_eap_ttls_server_t *this)
+static status_t start_phase2_tnc(private_eap_ttls_server_t *this,
+								 eap_type_t auth_type)
 {
+	eap_inner_method_t *inner_method;
+	eap_type_t type;
+	char *eap_type_str;
+
 	if (this->start_phase2_tnc && lib->settings->get_bool(lib->settings,
-					 	"charon.plugins.eap-ttls.phase2_tnc", FALSE))
+							"%s.plugins.eap-ttls.phase2_tnc", FALSE, lib->ns))
 	{
-		DBG1(DBG_IKE, "phase2 method %N selected", eap_type_names, EAP_TNC);
-		this->method = charon->eap->create_instance(charon->eap, EAP_TNC,
+		eap_type_str = lib->settings->get_str(lib->settings,
+							"%s.plugins.eap-ttls.phase2_tnc_method", "pt",
+							lib->ns);
+		type = eap_type_from_string(eap_type_str);
+		if (type == 0)
+		{
+			DBG1(DBG_IKE, "unrecognized phase2 EAP TNC method \"%s\"",
+						   eap_type_str);
+			return FAILED;
+		}
+		DBG1(DBG_IKE, "phase2 method %N selected", eap_type_names, type);
+		this->method = charon->eap->create_instance(charon->eap, type,
 									0, EAP_SERVER, this->server, this->peer);
 		if (this->method == NULL)
 		{
-			DBG1(DBG_IKE, "%N method not available", eap_type_names, EAP_TNC);
+			DBG1(DBG_IKE, "%N method not available", eap_type_names, type);
 			return FAILED;
 		}
+		inner_method = (eap_inner_method_t *)this->method;
+		inner_method->set_auth_type(inner_method, auth_type);
+
 		this->start_phase2_tnc = FALSE;
 		if (this->method->initiate(this->method, &this->out) == NEED_MORE)
 		{
@@ -127,7 +147,7 @@ static status_t start_phase2_tnc(private_eap_ttls_server_t *this)
 		}
 		else
 		{
-			DBG1(DBG_IKE, "%N method failed", eap_type_names, EAP_TNC);
+			DBG1(DBG_IKE, "%N method failed", eap_type_names, type);
 			return FAILED;
 		}
 	}
@@ -135,7 +155,7 @@ static status_t start_phase2_tnc(private_eap_ttls_server_t *this)
 }
 
 METHOD(tls_application_t, process, status_t,
-	private_eap_ttls_server_t *this, tls_reader_t *reader)
+	private_eap_ttls_server_t *this, bio_reader_t *reader)
 {
 	chunk_t data = chunk_empty;
 	status_t status;
@@ -143,7 +163,7 @@ METHOD(tls_application_t, process, status_t,
 	eap_payload_t *in;
 	eap_code_t code;
 	eap_type_t type = EAP_NAK, received_type;
-	u_int32_t vendor, received_vendor;
+	uint32_t vendor, received_vendor;
 
 	status = this->avp->process(this->avp, reader, &data);
 	switch (status)
@@ -168,7 +188,7 @@ METHOD(tls_application_t, process, status_t,
 	code = in->get_code(in);
 	received_type = in->get_type(in, &received_vendor);
 	DBG1(DBG_IKE, "received tunneled EAP-TTLS AVP [EAP/%N/%N]",
-					   		eap_code_short_names, code,
+							eap_code_short_names, code,
 							eap_type_short_names, received_type);
 	if (code != EAP_RESPONSE)
 	{
@@ -234,9 +254,9 @@ METHOD(tls_application_t, process, status_t,
 
 		/* Start Phase 2 of EAP-TTLS authentication */
 		if (lib->settings->get_bool(lib->settings,
-					 	"charon.plugins.eap-ttls.request_peer_auth", FALSE))
+					"%s.plugins.eap-ttls.request_peer_auth", FALSE, lib->ns))
 		{
-			return start_phase2_tnc(this);
+			return start_phase2_tnc(this, EAP_TLS);
 		}
 		else
 		{
@@ -264,7 +284,7 @@ METHOD(tls_application_t, process, status_t,
 			this->method = NULL;
 
 			/* continue phase2 with EAP-TNC? */
-			return start_phase2_tnc(this);
+			return start_phase2_tnc(this, type);
 		case NEED_MORE:
 			break;
 		case FAILED:
@@ -279,21 +299,21 @@ METHOD(tls_application_t, process, status_t,
 				DBG1(DBG_IKE, "%N method failed", eap_type_names, type);
 			}
 			return FAILED;
- 	}
+	}
 	return status;
 }
 
 METHOD(tls_application_t, build, status_t,
-	private_eap_ttls_server_t *this, tls_writer_t *writer)
+	private_eap_ttls_server_t *this, bio_writer_t *writer)
 {
 	chunk_t data;
 	eap_code_t code;
 	eap_type_t type;
-	u_int32_t vendor;
+	uint32_t vendor;
 
 	if (this->method == NULL && this->start_phase2 &&
 		lib->settings->get_bool(lib->settings,
-			 	"charon.plugins.eap-ttls.phase2_piggyback", FALSE))
+					"%s.plugins.eap-ttls.phase2_piggyback", FALSE, lib->ns))
 	{
 		/* generate an EAP Identity request which will be piggybacked right
 		 * onto the TLS Finished message thus initiating EAP-TTLS phase2

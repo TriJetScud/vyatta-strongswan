@@ -15,7 +15,7 @@
 
 #include <time.h>
 
-#include <debug.h>
+#include <utils/debug.h>
 #include <library.h>
 
 #include "sql_attribute.h"
@@ -38,7 +38,7 @@ struct private_sql_attribute_t {
 	database_t *db;
 
 	/**
-	 * wheter to record lease history in lease table
+	 * whether to record lease history in lease table
 	 */
 	bool history;
 };
@@ -51,15 +51,16 @@ static u_int get_identity(private_sql_attribute_t *this, identification_t *id)
 	enumerator_t *e;
 	u_int row;
 
+	this->db->transaction(this->db, TRUE);
 	/* look for peer identity in the identities table */
 	e = this->db->query(this->db,
 						"SELECT id FROM identities WHERE type = ? AND data = ?",
 						DB_INT, id->get_type(id), DB_BLOB, id->get_encoding(id),
 						DB_UINT);
-
 	if (e && e->enumerate(e, &row))
 	{
 		e->destroy(e);
+		this->db->commit(this->db);
 		return row;
 	}
 	DESTROY_IF(e);
@@ -68,8 +69,10 @@ static u_int get_identity(private_sql_attribute_t *this, identification_t *id)
 				  "INSERT INTO identities (type, data) VALUES (?, ?)",
 				  DB_INT, id->get_type(id), DB_BLOB, id->get_encoding(id)) == 1)
 	{
+		this->db->commit(this->db);
 		return row;
 	}
+	this->db->rollback(this->db);
 	return 0;
 }
 
@@ -94,19 +97,26 @@ static u_int get_attr_pool(private_sql_attribute_t *this, char *name)
 }
 
 /**
- * Lookup pool by name
+ * Lookup pool by name and address family
  */
-static u_int get_pool(private_sql_attribute_t *this, char *name, u_int *timeout)
+static u_int get_pool(private_sql_attribute_t *this, char *name, int family,
+					  u_int *timeout)
 {
 	enumerator_t *e;
+	chunk_t start;
 	u_int pool;
 
-	e = this->db->query(this->db, "SELECT id, timeout FROM pools WHERE name = ?",
-						DB_TEXT, name, DB_UINT, DB_UINT);
-	if (e && e->enumerate(e, &pool, timeout))
+	e = this->db->query(this->db,
+						"SELECT id, start, timeout FROM pools WHERE name = ?",
+						DB_TEXT, name, DB_UINT, DB_BLOB, DB_UINT);
+	if (e && e->enumerate(e, &pool, &start, timeout))
 	{
-		e->destroy(e);
-		return pool;
+		if ((family == AF_INET  && start.len == 4) ||
+			(family == AF_INET6 && start.len == 16))
+		{
+			e->destroy(e);
+			return pool;
+		}
 	}
 	DESTROY_IF(e);
 	return 0;
@@ -232,61 +242,43 @@ static host_t* get_lease(private_sql_attribute_t *this, char *name,
 	return NULL;
 }
 
-/**
- * Implementation of attribute_provider_t.acquire_address
- */
-static host_t* acquire_address(private_sql_attribute_t *this,
-							   char *names, identification_t *id,
-							   host_t *requested)
+METHOD(attribute_provider_t, acquire_address, host_t*,
+	private_sql_attribute_t *this, linked_list_t *pools, identification_t *id,
+	host_t *requested)
 {
+	enumerator_t *enumerator;
 	host_t *address = NULL;
 	u_int identity, pool, timeout;
+	char *name;
+	int family;
 
 	identity = get_identity(this, id);
 	if (identity)
 	{
-		/* check for a single pool first (no concatenation and enumeration) */
-		if (strchr(names, ',') == NULL)
+		family = requested->get_family(requested);
+		/* check for an existing lease in all pools */
+		enumerator = pools->create_enumerator(pools);
+		while (enumerator->enumerate(enumerator, &name))
 		{
-			pool = get_pool(this, names, &timeout);
+			pool = get_pool(this, name, family, &timeout);
 			if (pool)
 			{
-				/* check for an existing lease */
-				address = check_lease(this, names, pool, identity);
-				if (address == NULL)
+				address = check_lease(this, name, pool, identity);
+				if (address)
 				{
-					/* get an unallocated address or expired lease */
-					address = get_lease(this, names, pool, timeout, identity);
+					break;
 				}
 			}
 		}
-		else
+		enumerator->destroy(enumerator);
+
+		if (!address)
 		{
-			enumerator_t *enumerator;
-			char *name;
-
-			/* in a first step check for an existing lease over all pools */
-			enumerator = enumerator_create_token(names, ",", " ");
+			/* get an unallocated address or expired lease */
+			enumerator = pools->create_enumerator(pools);
 			while (enumerator->enumerate(enumerator, &name))
 			{
-				pool = get_pool(this, name, &timeout);
-				if (pool)
-				{
-					address = check_lease(this, name, pool, identity);
-					if (address)
-					{
-						enumerator->destroy(enumerator);
-						return address;
-					}
-				}
-			}
-			enumerator->destroy(enumerator);
-
-			/* in a second step get an unallocated address or expired lease */
-			enumerator = enumerator_create_token(names, ",", " ");
-			while (enumerator->enumerate(enumerator, &name))
-			{
-				pool = get_pool(this, name, &timeout);
+				pool = get_pool(this, name, family, &timeout);
 				if (pool)
 				{
 					address = get_lease(this, name, pool, timeout, identity);
@@ -302,23 +294,30 @@ static host_t* acquire_address(private_sql_attribute_t *this,
 	return address;
 }
 
-/**
- * Implementation of attribute_provider_t.release_address
- */
-static bool release_address(private_sql_attribute_t *this,
-							char *name, host_t *address, identification_t *id)
+METHOD(attribute_provider_t, release_address, bool,
+	private_sql_attribute_t *this, linked_list_t *pools, host_t *address,
+	identification_t *id)
 {
 	enumerator_t *enumerator;
-	bool found = FALSE;
+	u_int pool, timeout;
 	time_t now = time(NULL);
+	bool found = FALSE;
+	char *name;
+	int family;
 
-	enumerator = enumerator_create_token(name, ",", " ");
+	family = address->get_family(address);
+	enumerator = pools->create_enumerator(pools);
 	while (enumerator->enumerate(enumerator, &name))
 	{
-		u_int pool, timeout;
-
-		pool = get_pool(this, name, &timeout);
-		if (pool)
+		pool = get_pool(this, name, family, &timeout);
+		if (!pool)
+		{
+			continue;
+		}
+		if (this->db->execute(this->db, NULL,
+				"UPDATE addresses SET released = ? WHERE "
+				"pool = ? AND address = ?", DB_UINT, time(NULL),
+				DB_UINT, pool, DB_BLOB, address->get_address(address)) > 0)
 		{
 			if (this->history)
 			{
@@ -329,43 +328,34 @@ static bool release_address(private_sql_attribute_t *this,
 					DB_UINT, now, DB_UINT, pool,
 					DB_BLOB, address->get_address(address));
 			}
-			if (this->db->execute(this->db, NULL,
-					"UPDATE addresses SET released = ? WHERE "
-					"pool = ? AND address = ?", DB_UINT, time(NULL),
-					DB_UINT, pool, DB_BLOB, address->get_address(address)) > 0)
-			{
-				found = TRUE;
-				break;
-			}
+			found = TRUE;
+			break;
 		}
 	}
 	enumerator->destroy(enumerator);
+
 	return found;
 }
 
-/**
- * Implementation of sql_attribute_t.create_attribute_enumerator
- */
-static enumerator_t* create_attribute_enumerator(private_sql_attribute_t *this,
-								char *names, identification_t *id, host_t *vip)
+METHOD(attribute_provider_t, create_attribute_enumerator, enumerator_t*,
+	private_sql_attribute_t *this, linked_list_t *pools, identification_t *id,
+	linked_list_t *vips)
 {
 	enumerator_t *attr_enumerator = NULL;
 
-	if (vip)
+	if (vips->get_count(vips))
 	{
-		enumerator_t *names_enumerator;
+		enumerator_t *pool_enumerator;
 		u_int count;
 		char *name;
-
-		this->db->execute(this->db, NULL, "BEGIN EXCLUSIVE TRANSACTION");
 
 		/* in a first step check for attributes that match name and id */
 		if (id)
 		{
 			u_int identity = get_identity(this, id);
 
-			names_enumerator = enumerator_create_token(names, ",", " ");
-			while (names_enumerator->enumerate(names_enumerator, &name))
+			pool_enumerator = pools->create_enumerator(pools);
+			while (pool_enumerator->enumerate(pool_enumerator, &name))
 			{
 				u_int attr_pool = get_attr_pool(this, name);
 				if (!attr_pool)
@@ -392,14 +382,14 @@ static enumerator_t* create_attribute_enumerator(private_sql_attribute_t *this,
 				DESTROY_IF(attr_enumerator);
 				attr_enumerator = NULL;
 			}
-			names_enumerator->destroy(names_enumerator);
+			pool_enumerator->destroy(pool_enumerator);
 		}
 
 		/* in a second step check for attributes that match name */
 		if (!attr_enumerator)
 		{
-			names_enumerator = enumerator_create_token(names, ",", " ");
-			while (names_enumerator->enumerate(names_enumerator, &name))
+			pool_enumerator = pools->create_enumerator(pools);
+			while (pool_enumerator->enumerate(pool_enumerator, &name))
 			{
 				u_int attr_pool = get_attr_pool(this, name);
 				if (!attr_pool)
@@ -426,10 +416,8 @@ static enumerator_t* create_attribute_enumerator(private_sql_attribute_t *this,
 				DESTROY_IF(attr_enumerator);
 				attr_enumerator = NULL;
 			}
-			names_enumerator->destroy(names_enumerator);
+			pool_enumerator->destroy(pool_enumerator);
 		}
-
-		this->db->execute(this->db, NULL, "END TRANSACTION");
 
 		/* lastly try to find global attributes */
 		if (!attr_enumerator)
@@ -444,10 +432,8 @@ static enumerator_t* create_attribute_enumerator(private_sql_attribute_t *this,
 	return (attr_enumerator ? attr_enumerator : enumerator_create_empty());
 }
 
-/**
- * Implementation of sql_attribute_t.destroy
- */
-static void destroy(private_sql_attribute_t *this)
+METHOD(sql_attribute_t, destroy, void,
+	private_sql_attribute_t *this)
 {
 	free(this);
 }
@@ -457,17 +443,22 @@ static void destroy(private_sql_attribute_t *this)
  */
 sql_attribute_t *sql_attribute_create(database_t *db)
 {
-	private_sql_attribute_t *this = malloc_thing(private_sql_attribute_t);
+	private_sql_attribute_t *this;
 	time_t now = time(NULL);
 
-	this->public.provider.acquire_address = (host_t*(*)(attribute_provider_t *this, char*, identification_t *, host_t *))acquire_address;
-	this->public.provider.release_address = (bool(*)(attribute_provider_t *this, char*,host_t *, identification_t*))release_address;
-	this->public.provider.create_attribute_enumerator = (enumerator_t*(*)(attribute_provider_t*, char *names, identification_t *id, host_t *host))create_attribute_enumerator;
-	this->public.destroy = (void(*)(sql_attribute_t*))destroy;
-
-	this->db = db;
-	this->history = lib->settings->get_bool(lib->settings,
-						"libhydra.plugins.attr-sql.lease_history", TRUE);
+	INIT(this,
+		.public = {
+			.provider = {
+				.acquire_address = _acquire_address,
+				.release_address = _release_address,
+				.create_attribute_enumerator = _create_attribute_enumerator,
+			},
+			.destroy = _destroy,
+		},
+		.db = db,
+		.history = lib->settings->get_bool(lib->settings,
+							"%s.plugins.attr-sql.lease_history", TRUE, lib->ns),
+	);
 
 	/* close any "online" leases in the case we crashed */
 	if (this->history)
@@ -482,4 +473,3 @@ sql_attribute_t *sql_attribute_create(database_t *db)
 					  DB_UINT, now);
 	return &this->public;
 }
-

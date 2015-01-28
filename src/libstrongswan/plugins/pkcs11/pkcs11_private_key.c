@@ -1,4 +1,7 @@
 /*
+ * Copyright (C) 2011 Tobias Brunner
+ * Hochschule fuer Technik Rapperswil
+ *
  * Copyright (C) 2010 Martin Willi
  * Copyright (C) 2010 revosec AG
  *
@@ -17,9 +20,9 @@
 
 #include "pkcs11_library.h"
 #include "pkcs11_manager.h"
+#include "pkcs11_public_key.h"
 
-#include <debug.h>
-#include <threading/mutex.h>
+#include <utils/debug.h>
 
 typedef struct private_pkcs11_private_key_t private_pkcs11_private_key_t;
 
@@ -39,14 +42,14 @@ struct private_pkcs11_private_key_t {
 	pkcs11_library_t *lib;
 
 	/**
+	 * Slot the token is in
+	 */
+	CK_SLOT_ID slot;
+
+	/**
 	 * Token session
 	 */
 	CK_SESSION_HANDLE session;
-
-	/**
-	 * Mutex to lock session
-	 */
-	mutex_t *mutex;
 
 	/**
 	 * Key object on the token
@@ -72,12 +75,18 @@ struct private_pkcs11_private_key_t {
 	 * References to this key
 	 */
 	refcount_t ref;
+
+	/**
+	 * Type of this private key
+	 */
+	key_type_t type;
 };
+
 
 METHOD(private_key_t, get_type, key_type_t,
 	private_pkcs11_private_key_t *this)
 {
-	return this->pubkey->get_type(this->pubkey);
+	return this->type;
 }
 
 METHOD(private_key_t, get_keysize, int,
@@ -89,18 +98,45 @@ METHOD(private_key_t, get_keysize, int,
 /**
  * See header.
  */
-CK_MECHANISM_PTR pkcs11_signature_scheme_to_mech(signature_scheme_t scheme)
+CK_MECHANISM_PTR pkcs11_signature_scheme_to_mech(signature_scheme_t scheme,
+												 key_type_t type, size_t keylen,
+												 hash_algorithm_t *hash)
 {
 	static struct {
 		signature_scheme_t scheme;
 		CK_MECHANISM mechanism;
+		key_type_t type;
+		size_t keylen;
+		hash_algorithm_t hash;
 	} mappings[] = {
-		{SIGN_RSA_EMSA_PKCS1_NULL,		{CKM_RSA_PKCS,				NULL, 0}},
-		{SIGN_RSA_EMSA_PKCS1_SHA1,		{CKM_SHA1_RSA_PKCS,			NULL, 0}},
-		{SIGN_RSA_EMSA_PKCS1_SHA256,	{CKM_SHA256_RSA_PKCS,		NULL, 0}},
-		{SIGN_RSA_EMSA_PKCS1_SHA384,	{CKM_SHA384_RSA_PKCS,		NULL, 0}},
-		{SIGN_RSA_EMSA_PKCS1_SHA512,	{CKM_SHA512_RSA_PKCS,		NULL, 0}},
-		{SIGN_RSA_EMSA_PKCS1_MD5,		{CKM_MD5_RSA_PKCS,			NULL, 0}},
+		{SIGN_RSA_EMSA_PKCS1_NULL,		{CKM_RSA_PKCS,			NULL, 0},
+		 KEY_RSA, 0,									   HASH_UNKNOWN},
+		{SIGN_RSA_EMSA_PKCS1_SHA1,		{CKM_SHA1_RSA_PKCS,		NULL, 0},
+		 KEY_RSA, 0,									   HASH_UNKNOWN},
+		{SIGN_RSA_EMSA_PKCS1_SHA256,	{CKM_SHA256_RSA_PKCS,	NULL, 0},
+		 KEY_RSA, 0,									   HASH_UNKNOWN},
+		{SIGN_RSA_EMSA_PKCS1_SHA384,	{CKM_SHA384_RSA_PKCS,	NULL, 0},
+		 KEY_RSA, 0,									   HASH_UNKNOWN},
+		{SIGN_RSA_EMSA_PKCS1_SHA512,	{CKM_SHA512_RSA_PKCS,	NULL, 0},
+		 KEY_RSA, 0,									   HASH_UNKNOWN},
+		{SIGN_RSA_EMSA_PKCS1_MD5,		{CKM_MD5_RSA_PKCS,		NULL, 0},
+		 KEY_RSA, 0,									   HASH_UNKNOWN},
+		{SIGN_ECDSA_WITH_NULL,			{CKM_ECDSA,				NULL, 0},
+		 KEY_ECDSA, 0,									   HASH_UNKNOWN},
+		{SIGN_ECDSA_WITH_SHA1_DER,		{CKM_ECDSA_SHA1,		NULL, 0},
+		 KEY_ECDSA, 0,									   HASH_UNKNOWN},
+		{SIGN_ECDSA_WITH_SHA256_DER,	{CKM_ECDSA,				NULL, 0},
+		 KEY_ECDSA, 0,										HASH_SHA256},
+		{SIGN_ECDSA_WITH_SHA384_DER,	{CKM_ECDSA,				NULL, 0},
+		 KEY_ECDSA, 0,										HASH_SHA384},
+		{SIGN_ECDSA_WITH_SHA512_DER,	{CKM_ECDSA,				NULL, 0},
+		 KEY_ECDSA, 0,										HASH_SHA512},
+		{SIGN_ECDSA_256,				{CKM_ECDSA,				NULL, 0},
+		 KEY_ECDSA, 256,									HASH_SHA256},
+		{SIGN_ECDSA_384,				{CKM_ECDSA,				NULL, 0},
+		 KEY_ECDSA, 384,									HASH_SHA384},
+		{SIGN_ECDSA_521,				{CKM_ECDSA,				NULL, 0},
+		 KEY_ECDSA, 521,									HASH_SHA512},
 	};
 	int i;
 
@@ -108,6 +144,15 @@ CK_MECHANISM_PTR pkcs11_signature_scheme_to_mech(signature_scheme_t scheme)
 	{
 		if (mappings[i].scheme == scheme)
 		{
+			size_t len = mappings[i].keylen;
+			if (mappings[i].type != type || (len && keylen != len))
+			{
+				return NULL;
+			}
+			if (hash)
+			{
+				*hash = mappings[i].hash;
+			}
 			return &mappings[i].mechanism;
 		}
 	}
@@ -141,7 +186,8 @@ CK_MECHANISM_PTR pkcs11_encryption_scheme_to_mech(encryption_scheme_t scheme)
 /**
  * Reauthenticate to do a signature
  */
-static bool reauth(private_pkcs11_private_key_t *this)
+static bool reauth(private_pkcs11_private_key_t *this,
+				   CK_SESSION_HANDLE session)
 {
 	enumerator_t *enumerator;
 	shared_key_t *shared;
@@ -155,7 +201,7 @@ static bool reauth(private_pkcs11_private_key_t *this)
 	{
 		found = TRUE;
 		pin = shared->get_key(shared);
-		rv = this->lib->f->C_Login(this->session, CKU_CONTEXT_SPECIFIC,
+		rv = this->lib->f->C_Login(session, CKU_CONTEXT_SPECIFIC,
 								   pin.ptr, pin.len);
 		if (rv == CKR_OK)
 		{
@@ -179,33 +225,63 @@ METHOD(private_key_t, sign, bool,
 	chunk_t data, chunk_t *signature)
 {
 	CK_MECHANISM_PTR mechanism;
+	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR buf;
 	CK_ULONG len;
 	CK_RV rv;
+	hash_algorithm_t hash_alg;
+	chunk_t hash = chunk_empty;
 
-	mechanism = pkcs11_signature_scheme_to_mech(scheme);
+	mechanism = pkcs11_signature_scheme_to_mech(scheme, this->type,
+												get_keysize(this), &hash_alg);
 	if (!mechanism)
 	{
 		DBG1(DBG_LIB, "signature scheme %N not supported",
 			 signature_scheme_names, scheme);
 		return FALSE;
 	}
-	this->mutex->lock(this->mutex);
-	rv = this->lib->f->C_SignInit(this->session, mechanism, this->object);
-	if (this->reauth && !reauth(this))
+	rv = this->lib->f->C_OpenSession(this->slot, CKF_SERIAL_SESSION, NULL, NULL,
+									 &session);
+	if (rv != CKR_OK)
 	{
+		DBG1(DBG_CFG, "opening PKCS#11 session failed: %N", ck_rv_names, rv);
+		return FALSE;
+	}
+	rv = this->lib->f->C_SignInit(session, mechanism, this->object);
+	if (this->reauth && !reauth(this, session))
+	{
+		this->lib->f->C_CloseSession(session);
 		return FALSE;
 	}
 	if (rv != CKR_OK)
 	{
-		this->mutex->unlock(this->mutex);
+		this->lib->f->C_CloseSession(session);
 		DBG1(DBG_LIB, "C_SignInit() failed: %N", ck_rv_names, rv);
 		return FALSE;
 	}
+	if (hash_alg != HASH_UNKNOWN)
+	{
+		hasher_t *hasher;
+
+		hasher = lib->crypto->create_hasher(lib->crypto, hash_alg);
+		if (!hasher || !hasher->allocate_hash(hasher, data, &hash))
+		{
+			DESTROY_IF(hasher);
+			this->lib->f->C_CloseSession(session);
+			return FALSE;
+		}
+		hasher->destroy(hasher);
+		data = hash;
+	}
 	len = (get_keysize(this) + 7) / 8;
+	if (this->type == KEY_ECDSA)
+	{	/* signature is twice the length of the base point order */
+		len *= 2;
+	}
 	buf = malloc(len);
-	rv = this->lib->f->C_Sign(this->session, data.ptr, data.len, buf, &len);
-	this->mutex->unlock(this->mutex);
+	rv = this->lib->f->C_Sign(session, data.ptr, data.len, buf, &len);
+	this->lib->f->C_CloseSession(session);
+	chunk_free(&hash);
 	if (rv != CKR_OK)
 	{
 		DBG1(DBG_LIB, "C_Sign() failed: %N", ck_rv_names, rv);
@@ -221,6 +297,7 @@ METHOD(private_key_t, decrypt, bool,
 	chunk_t crypt, chunk_t *plain)
 {
 	CK_MECHANISM_PTR mechanism;
+	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR buf;
 	CK_ULONG len;
 	CK_RV rv;
@@ -232,22 +309,29 @@ METHOD(private_key_t, decrypt, bool,
 			 encryption_scheme_names, scheme);
 		return FALSE;
 	}
-	this->mutex->lock(this->mutex);
-	rv = this->lib->f->C_DecryptInit(this->session, mechanism, this->object);
-	if (this->reauth && !reauth(this))
+	rv = this->lib->f->C_OpenSession(this->slot, CKF_SERIAL_SESSION, NULL, NULL,
+									 &session);
+	if (rv != CKR_OK)
 	{
+		DBG1(DBG_CFG, "opening PKCS#11 session failed: %N", ck_rv_names, rv);
+		return FALSE;
+	}
+	rv = this->lib->f->C_DecryptInit(session, mechanism, this->object);
+	if (this->reauth && !reauth(this, session))
+	{
+		this->lib->f->C_CloseSession(session);
 		return FALSE;
 	}
 	if (rv != CKR_OK)
 	{
-		this->mutex->unlock(this->mutex);
+		this->lib->f->C_CloseSession(session);
 		DBG1(DBG_LIB, "C_DecryptInit() failed: %N", ck_rv_names, rv);
 		return FALSE;
 	}
 	len = (get_keysize(this) + 7) / 8;
 	buf = malloc(len);
-	rv = this->lib->f->C_Decrypt(this->session, crypt.ptr, crypt.len, buf, &len);
-	this->mutex->unlock(this->mutex);
+	rv = this->lib->f->C_Decrypt(session, crypt.ptr, crypt.len, buf, &len);
+	this->lib->f->C_CloseSession(session);
 	if (rv != CKR_OK)
 	{
 		DBG1(DBG_LIB, "C_Decrypt() failed: %N", ck_rv_names, rv);
@@ -294,7 +378,6 @@ METHOD(private_key_t, destroy, void,
 		{
 			this->pubkey->destroy(this->pubkey);
 		}
-		this->mutex->destroy(this->mutex);
 		this->keyid->destroy(this->keyid);
 		this->lib->f->C_CloseSession(this->session);
 		free(this);
@@ -311,7 +394,7 @@ static pkcs11_library_t* find_lib(char *module)
 	pkcs11_library_t *p11, *found = NULL;
 	CK_SLOT_ID slot;
 
-	manager = pkcs11_manager_get();
+	manager = lib->get(lib, "pkcs11-manager");
 	if (!manager)
 	{
 		return NULL;
@@ -332,14 +415,15 @@ static pkcs11_library_t* find_lib(char *module)
 /**
  * Find the PKCS#11 lib having a keyid, and optionally a slot
  */
-static pkcs11_library_t* find_lib_by_keyid(chunk_t keyid, int *slot)
+static pkcs11_library_t* find_lib_by_keyid(chunk_t keyid, int *slot,
+										   CK_OBJECT_CLASS class)
 {
 	pkcs11_manager_t *manager;
 	enumerator_t *enumerator;
 	pkcs11_library_t *p11, *found = NULL;
 	CK_SLOT_ID current;
 
-	manager = pkcs11_manager_get();
+	manager = lib->get(lib, "pkcs11-manager");
 	if (!manager)
 	{
 		return NULL;
@@ -349,8 +433,7 @@ static pkcs11_library_t* find_lib_by_keyid(chunk_t keyid, int *slot)
 	{
 		if (*slot == -1 || *slot == current)
 		{
-			/* we look for a public key, it is usually readable without login */
-			CK_OBJECT_CLASS class = CKO_PUBLIC_KEY;
+			/* look for a pubkey/cert, it is usually readable without login */
 			CK_ATTRIBUTE tmpl[] = {
 				{CKA_CLASS, &class, sizeof(class)},
 				{CKA_ID, keyid.ptr, keyid.len},
@@ -404,13 +487,11 @@ static bool find_key(private_pkcs11_private_key_t *this, chunk_t keyid)
 	CK_BBOOL reauth = FALSE;
 	CK_ATTRIBUTE attr[] = {
 		{CKA_KEY_TYPE, &type, sizeof(type)},
-		{CKA_MODULUS, NULL, 0},
-		{CKA_PUBLIC_EXPONENT, NULL, 0},
 		{CKA_ALWAYS_AUTHENTICATE, &reauth, sizeof(reauth)},
 	};
 	enumerator_t *enumerator;
-	chunk_t modulus, pubexp;
 	int count = countof(attr);
+	bool found = FALSE;
 
 	/* do not use CKA_ALWAYS_AUTHENTICATE if not supported */
 	if (!(this->lib->get_features(this->lib) & PKCS11_ALWAYS_AUTH_KEYS))
@@ -421,26 +502,16 @@ static bool find_key(private_pkcs11_private_key_t *this, chunk_t keyid)
 							this->session, tmpl, countof(tmpl), attr, count);
 	if (enumerator->enumerate(enumerator, &object))
 	{
+		this->type = KEY_RSA;
 		switch (type)
 		{
+			case CKK_ECDSA:
+				this->type = KEY_ECDSA;
+				/* fall-through */
 			case CKK_RSA:
-				if (attr[1].ulValueLen == -1 || attr[2].ulValueLen == -1)
-				{
-					DBG1(DBG_CFG, "reading modulus/exponent from PKCS#1 failed");
-					break;
-				}
-				modulus = chunk_create(attr[1].pValue, attr[1].ulValueLen);
-				pubexp = chunk_create(attr[2].pValue, attr[2].ulValueLen);
-				this->pubkey = lib->creds->create(lib->creds, CRED_PUBLIC_KEY,
-									KEY_RSA, BUILD_RSA_MODULUS, modulus,
-									BUILD_RSA_PUB_EXP, pubexp, BUILD_END);
-				if (!this->pubkey)
-				{
-					DBG1(DBG_CFG, "extracting public key from PKCS#11 RSA "
-						 "private key failed");
-				}
 				this->reauth = reauth;
 				this->object = object;
+				found = TRUE;
 				break;
 			default:
 				DBG1(DBG_CFG, "PKCS#11 key type %d not supported", type);
@@ -448,7 +519,7 @@ static bool find_key(private_pkcs11_private_key_t *this, chunk_t keyid)
 		}
 	}
 	enumerator->destroy(enumerator);
-	return this->pubkey != NULL;
+	return found;
 }
 
 /**
@@ -498,6 +569,50 @@ static bool login(private_pkcs11_private_key_t *this, int slot)
 		return FALSE;
 	}
 	return success;
+}
+
+/**
+ * Get a public key from a certificate with a given key ID.
+ */
+static public_key_t* find_pubkey_in_certs(private_pkcs11_private_key_t *this,
+										  chunk_t keyid)
+{
+	CK_OBJECT_CLASS class = CKO_CERTIFICATE;
+	CK_CERTIFICATE_TYPE type = CKC_X_509;
+	CK_ATTRIBUTE tmpl[] = {
+		{CKA_CLASS, &class, sizeof(class)},
+		{CKA_CERTIFICATE_TYPE, &type, sizeof(type)},
+		{CKA_ID, keyid.ptr, keyid.len},
+	};
+	CK_OBJECT_HANDLE object;
+	CK_ATTRIBUTE attr[] = {
+		{CKA_VALUE, NULL, 0},
+	};
+	enumerator_t *enumerator;
+	chunk_t data = chunk_empty;
+	public_key_t *key = NULL;
+	certificate_t *cert;
+
+	enumerator = this->lib->create_object_enumerator(this->lib, this->session,
+									tmpl, countof(tmpl), attr, countof(attr));
+	if (enumerator->enumerate(enumerator, &object))
+	{
+		data = chunk_clone(chunk_create(attr[0].pValue, attr[0].ulValueLen));
+	}
+	enumerator->destroy(enumerator);
+
+	if (data.ptr)
+	{
+		cert = lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509,
+								  BUILD_BLOB_ASN1_DER, data, BUILD_END);
+		free(data.ptr);
+		if (cert)
+		{
+			key = cert->get_public_key(cert);
+			cert->destroy(cert);
+		}
+	}
+	return key;
 }
 
 /**
@@ -568,7 +683,11 @@ pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 	}
 	else
 	{
-		this->lib = find_lib_by_keyid(keyid, &slot);
+		this->lib = find_lib_by_keyid(keyid, &slot, CKO_PUBLIC_KEY);
+		if (!this->lib)
+		{
+			this->lib = find_lib_by_keyid(keyid, &slot, CKO_CERTIFICATE);
+		}
 		if (!this->lib)
 		{
 			DBG1(DBG_CFG, "no PKCS#11 module found having a keyid %#B", &keyid);
@@ -587,7 +706,7 @@ pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 		return NULL;
 	}
 
-	this->mutex = mutex_create(MUTEX_TYPE_DEFAULT);
+	this->slot = slot;
 	this->keyid = identification_create_from_encoding(ID_KEY_ID, keyid);
 
 	if (!login(this, slot))
@@ -600,6 +719,19 @@ pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 	{
 		destroy(this);
 		return NULL;
+	}
+
+	this->pubkey = pkcs11_public_key_connect(this->lib, slot, this->type, keyid);
+	if (!this->pubkey)
+	{
+		this->pubkey = find_pubkey_in_certs(this, keyid);
+		if (!this->pubkey)
+		{
+			DBG1(DBG_CFG, "no public key or certificate found for private key "
+				 "on '%s':%d", module, slot);
+			destroy(this);
+			return NULL;
+		}
 	}
 
 	return &this->public;

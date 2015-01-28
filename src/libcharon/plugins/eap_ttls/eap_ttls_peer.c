@@ -16,10 +16,10 @@
 #include "eap_ttls_peer.h"
 #include "eap_ttls_avp.h"
 
-#include <debug.h>
+#include <utils/debug.h>
 #include <daemon.h>
-
-#include <sa/authenticators/eap/eap_method.h>
+#include <radius_message.h>
+#include <sa/eap/eap_method.h>
 
 typedef struct private_eap_ttls_peer_t private_eap_ttls_peer_t;
 
@@ -64,10 +64,8 @@ struct private_eap_ttls_peer_t {
 	eap_ttls_avp_t *avp;
 };
 
-#define MAX_RADIUS_ATTRIBUTE_SIZE	253
-
 METHOD(tls_application_t, process, status_t,
-	private_eap_ttls_peer_t *this, tls_reader_t *reader)
+	private_eap_ttls_peer_t *this, bio_reader_t *reader)
 {
 	chunk_t avp_data = chunk_empty;
 	chunk_t eap_data = chunk_empty;
@@ -140,7 +138,7 @@ METHOD(tls_application_t, process, status_t,
 		chunk_free(&avp_data);
 	}
 	while (eap_pos < eap_data.len);
- 		
+
 	in = eap_payload_create_data(eap_data);
 	chunk_free(&eap_data);
 	payload = (payload_t*)in;
@@ -194,7 +192,8 @@ METHOD(tls_application_t, process, status_t,
 		if (!this->method)
 		{
 			DBG1(DBG_IKE, "EAP method not supported");
-			this->out = eap_payload_create_nak(in->get_identifier(in));
+			this->out = eap_payload_create_nak(in->get_identifier(in), 0, 0,
+											   in->is_expanded(in));
 			in->destroy(in);
 			return NEED_MORE;
 		}
@@ -229,7 +228,7 @@ METHOD(tls_application_t, process, status_t,
 }
 
 METHOD(tls_application_t, build, status_t,
-	private_eap_ttls_peer_t *this, tls_writer_t *writer)
+	private_eap_ttls_peer_t *this, bio_writer_t *writer)
 {
 	chunk_t data;
 	eap_code_t code;

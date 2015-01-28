@@ -21,40 +21,9 @@
 #ifndef THREADING_THREAD_H_
 #define THREADING_THREAD_H_
 
+#include <utils/utils.h>
+
 typedef struct thread_t thread_t;
-
-#ifdef __APPLE__
-/* thread_create is a syscall used to create Mach kernel threads and although
- * there are no errors or warnings during compilation or linkage the dynamic
- * linker does not use our implementation, therefore we rename it here
- */
-#define thread_create(main, arg) strongswan_thread_create(main, arg)
-
-/* on Mac OS X 10.5 several system calls we use are no cancellation points.
- * fortunately, select isn't one of them, so we wrap some of the others with
- * calls to select(2).
- */
-#include <sys/socket.h>
-#include <sys/select.h>
-
-#define WRAP_WITH_SELECT(func, socket, ...)\
-	fd_set rfds; FD_ZERO(&rfds); FD_SET(socket, &rfds);\
-	if (select(socket + 1, &rfds, NULL, NULL, NULL) <= 0) { return -1; }\
-	return func(socket, __VA_ARGS__)
-
-static inline int cancellable_accept(int socket, struct sockaddr *address,
-									 socklen_t *address_len)
-{
-	WRAP_WITH_SELECT(accept, socket, address, address_len);
-}
-#define accept cancellable_accept
-static inline int cancellable_recvfrom(int socket, void *buffer, size_t length,
-				int flags, struct sockaddr *address, socklen_t *address_len)
-{
-	WRAP_WITH_SELECT(recvfrom, socket, buffer, length, flags, address, address_len);
-}
-#define recvfrom cancellable_recvfrom
-#endif /* __APPLE__ */
 
 /**
  * Main function of a thread.
@@ -70,7 +39,6 @@ typedef void *(*thread_main_t)(void *arg);
  * @param arg			argument provided to thread_cleanup_push
  */
 typedef void (*thread_cleanup_t)(void *arg);
-
 
 /**
  * Thread wrapper implements simple, portable and advanced thread functions.
@@ -110,9 +78,7 @@ struct thread_t {
 	 *					a call to exit.
 	 */
 	void *(*join)(thread_t *this);
-
 };
-
 
 /**
  * Create a new thread instance.
@@ -168,6 +134,10 @@ bool thread_cancelability(bool enable);
 
 /**
  * Force creation of a cancellation point in the calling thread.
+ *
+ * This temporarily enables thread cancelability, tests for a pending
+ * cancellation request and then disables cancelability again if it was
+ * disabled before the call to thread_cancellation_point().
  */
 void thread_cancellation_point();
 
@@ -188,6 +158,4 @@ void threads_init();
  */
 void threads_deinit();
 
-
 #endif /** THREADING_THREAD_H_ @} */
-

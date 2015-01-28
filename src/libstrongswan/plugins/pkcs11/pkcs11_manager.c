@@ -15,8 +15,8 @@
 
 #include "pkcs11_manager.h"
 
-#include <debug.h>
-#include <utils/linked_list.h>
+#include <utils/debug.h>
+#include <collections/linked_list.h>
 #include <threading/thread.h>
 
 #include "pkcs11_library.h"
@@ -61,8 +61,6 @@ typedef struct {
 	char *path;
 	/* loaded library */
 	pkcs11_library_t *lib;
-	/* event dispatcher job */
-	callback_job_t *job;
 } lib_entry_t;
 
 /**
@@ -70,10 +68,6 @@ typedef struct {
  */
 static void lib_entry_destroy(lib_entry_t *entry)
 {
-	if (entry->job)
-	{
-		entry->job->cancel(entry->job);
-	}
 	entry->lib->destroy(entry->lib);
 	free(entry);
 }
@@ -202,14 +196,6 @@ static job_requeue_t dispatch_slot_events(lib_entry_t *entry)
 }
 
 /**
- * End dispatching, unset job
- */
-static void end_dispatch(lib_entry_t *entry)
-{
-	entry->job = NULL;
-}
-
-/**
  * Get the slot list of a library
  */
 static CK_SLOT_ID_PTR get_slot_list(pkcs11_library_t *p11, CK_ULONG *out)
@@ -323,17 +309,11 @@ METHOD(pkcs11_manager_t, create_token_enumerator, enumerator_t*,
 	return &enumerator->public;
 }
 
-/**
- * Singleton instance
- */
-static private_pkcs11_manager_t *singleton = NULL;
-
 METHOD(pkcs11_manager_t, destroy, void,
 	private_pkcs11_manager_t *this)
 {
 	this->libs->destroy_function(this->libs, (void*)lib_entry_destroy);
 	free(this);
-	singleton = NULL;
 }
 
 /**
@@ -358,7 +338,7 @@ pkcs11_manager_t *pkcs11_manager_create(pkcs11_manager_token_event_t cb,
 	);
 
 	enumerator = lib->settings->create_section_enumerator(lib->settings,
-										"libstrongswan.plugins.pkcs11.modules");
+										"%s.plugins.pkcs11.modules", lib->ns);
 	while (enumerator->enumerate(enumerator, &module))
 	{
 		INIT(entry,
@@ -366,7 +346,7 @@ pkcs11_manager_t *pkcs11_manager_create(pkcs11_manager_token_event_t cb,
 		);
 
 		entry->path = lib->settings->get_str(lib->settings,
-				"libstrongswan.plugins.pkcs11.modules.%s.path", NULL, module);
+				"%s.plugins.pkcs11.modules.%s.path", NULL, lib->ns, module);
 		if (!entry->path)
 		{
 			DBG1(DBG_CFG, "PKCS11 module '%s' lacks library path", module);
@@ -375,8 +355,8 @@ pkcs11_manager_t *pkcs11_manager_create(pkcs11_manager_token_event_t cb,
 		}
 		entry->lib = pkcs11_library_create(module, entry->path,
 						lib->settings->get_bool(lib->settings,
-							"libstrongswan.plugins.pkcs11.modules.%s.os_locking",
-							FALSE, module));
+							"%s.plugins.pkcs11.modules.%s.os_locking",
+							FALSE, lib->ns, module));
 		if (!entry->lib)
 		{
 			free(entry);
@@ -386,25 +366,16 @@ pkcs11_manager_t *pkcs11_manager_create(pkcs11_manager_token_event_t cb,
 	}
 	enumerator->destroy(enumerator);
 
-	singleton = this;
-
 	enumerator = this->libs->create_enumerator(this->libs);
 	while (enumerator->enumerate(enumerator, &entry))
 	{
 		query_slots(entry);
-		entry->job = callback_job_create((void*)dispatch_slot_events,
-										 entry, (void*)end_dispatch, NULL);
-		lib->processor->queue_job(lib->processor, (job_t*)entry->job);
+		lib->processor->queue_job(lib->processor,
+			(job_t*)callback_job_create_with_prio((void*)dispatch_slot_events,
+						entry, NULL, (void*)return_false, JOB_PRIO_CRITICAL));
 	}
 	enumerator->destroy(enumerator);
 
 	return &this->public;
 }
 
-/**
- * See header
- */
-pkcs11_manager_t *pkcs11_manager_get()
-{
-	return (pkcs11_manager_t*)singleton;
-}

@@ -21,7 +21,7 @@
 #ifndef STORAGE_H_
 #define STORAGE_H_
 
-#include <utils/enumerator.h>
+#include <collections/enumerator.h>
 
 
 typedef struct storage_t storage_t;
@@ -41,7 +41,7 @@ struct storage_t {
 	int (*login)(storage_t *this, char *username, char *password);
 
 	/**
-	 * Create an iterator over the gateways.
+	 * Create an enumerator over the gateways.
 	 *
 	 * enumerate() arguments: int id, char *name, int port, char *address
 	 * If port is 0, address is a Unix socket address.

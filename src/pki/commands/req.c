@@ -16,10 +16,11 @@
  */
 
 #include <time.h>
+#include <errno.h>
 
 #include "pki.h"
 
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 #include <credentials/certificates/certificate.h>
 
 /**
@@ -56,6 +57,10 @@ static int req()
 				{
 					type = KEY_ECDSA;
 				}
+				else if (streq(arg, "bliss"))
+				{
+					type = KEY_BLISS;
+				}
 				else
 				{
 					error = "invalid input type";
@@ -63,8 +68,7 @@ static int req()
 				}
 				continue;
 			case 'g':
-				digest = get_digest(arg);
-				if (digest == HASH_UNKNOWN)
+				if (!enum_from_name(hash_algorithm_short_names, arg, &digest))
 				{
 					error = "invalid --digest type";
 					goto usage;
@@ -98,6 +102,11 @@ static int req()
 		break;
 	}
 
+	if (type == KEY_BLISS)
+	{
+		/* currently only SHA-512 is supported */
+		digest = HASH_SHA512;
+	}
 	if (!dn)
 	{
 		error = "--dn is required";
@@ -116,8 +125,18 @@ static int req()
 	}
 	else
 	{
+		chunk_t chunk;
+
+		set_file_mode(stdin, CERT_ASN1_DER);
+		if (!chunk_from_fd(0, &chunk))
+		{
+			fprintf(stderr, "reading private key failed: %s\n", strerror(errno));
+			error = "";
+			goto end;
+		}
 		private = lib->creds->create(lib->creds, CRED_PRIVATE_KEY, type,
-									 BUILD_FROM_FD, 0, BUILD_END);
+									 BUILD_BLOB, chunk, BUILD_END);
+		free(chunk.ptr);
 	}
 	if (!private)
 	{
@@ -141,6 +160,7 @@ static int req()
 		error = "encoding certificate request failed";
 		goto end;
 	}
+	set_file_mode(stdout, form);
 	if (fwrite(encoding.ptr, encoding.len, 1, stdout) != 1)
 	{
 		error = "writing certificate request failed";
@@ -174,9 +194,8 @@ static void __attribute__ ((constructor))reg()
 	command_register((command_t) {
 		req, 'r', "req",
 		"create a PKCS#10 certificate request",
-		{"[--in file] [--type rsa|ecdsa]",
-		 " --dn distinguished-name [--san subjectAltName]+",
-		 "[--password challengePassword]",
+		{"  [--in file] [--type rsa|ecdsa|bliss] --dn distinguished-name",
+		 "[--san subjectAltName]+ [--password challengePassword]",
 		 "[--digest md5|sha1|sha224|sha256|sha384|sha512] [--outform der|pem]"},
 		{
 			{"help",	'h', 0, "show usage information"},

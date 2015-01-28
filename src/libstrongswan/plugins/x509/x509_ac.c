@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2002 Ueli Galizzi, Ariane Seiler
  * Copyright (C) 2003 Martin Berner, Lukas Suter
- * Copyright (C) 2002-2009 Andreas Steffen
+ * Copyright (C) 2002-2014 Andreas Steffen
  * Copyright (C) 2009 Martin Willi
  *
  * HSR Hochschule fuer Technik Rapperswil
@@ -22,14 +22,13 @@
 #include <time.h>
 
 #include <library.h>
-#include <debug.h>
+#include <utils/debug.h>
 #include <asn1/oid.h>
 #include <asn1/asn1.h>
 #include <asn1/asn1_parser.h>
 #include <utils/identification.h>
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 #include <credentials/certificates/x509.h>
-#include <credentials/ietf_attributes/ietf_attributes.h>
 #include <credentials/keys/private_key.h>
 
 extern chunk_t x509_parse_authorityKeyIdentifier(chunk_t blob,
@@ -75,7 +74,7 @@ struct private_x509_ac_t {
 	/**
 	 * Serial number of the holder certificate
 	 */
-	chunk_t holderSerial;
+	identification_t *holderSerial;
 
 	/**
 	 * ID representing the holder
@@ -98,14 +97,9 @@ struct private_x509_ac_t {
 	time_t notAfter;
 
 	/**
-	 * List of charging attributes
+	 * List of group attributes, as group_t
 	 */
-	ietf_attributes_t *charging;
-
-	/**
-	 * List of groub attributes
-	 */
-	ietf_attributes_t *groups;
+	linked_list_t *groups;
 
 	/**
 	 * Authority Key Identifier
@@ -153,6 +147,25 @@ struct private_x509_ac_t {
 	refcount_t ref;
 };
 
+/**
+ * Group definition, an IETF attribute
+ */
+typedef struct {
+	/** Attribute type */
+	ac_group_type_t type;
+	/* attribute value */
+	chunk_t value;
+} group_t;
+
+/**
+ * Clean up a group entry
+ */
+static void group_destroy(group_t *group)
+{
+	free(group->value.ptr);
+	free(group);
+}
+
 static chunk_t ASN1_noRevAvail_ext = chunk_from_chars(
 	0x30, 0x09,
 		  0x06, 0x03,
@@ -169,42 +182,41 @@ extern void x509_parse_generalNames(chunk_t blob, int level0, bool implicit,
 /**
  * parses a directoryName
  */
-static bool parse_directoryName(chunk_t blob, int level, bool implicit, identification_t **name)
+static bool parse_directoryName(chunk_t blob, int level, bool implicit,
+								identification_t **name)
 {
-	bool has_directoryName;
-	linked_list_t *list = linked_list_create();
+	identification_t *directoryName;
+	enumerator_t *enumerator;
+	bool first = TRUE;
+	linked_list_t *list;
 
+	list = linked_list_create();
 	x509_parse_generalNames(blob, level, implicit, list);
-	has_directoryName = list->get_count(list) > 0;
 
-	if (has_directoryName)
+	enumerator = list->create_enumerator(list);
+	while (enumerator->enumerate(enumerator, &directoryName))
 	{
-		iterator_t *iterator = list->create_iterator(list, TRUE);
-		identification_t *directoryName;
-		bool first = TRUE;
-
-		while (iterator->iterate(iterator, (void**)&directoryName))
+		if (first)
 		{
-			if (first)
-			{
-				*name = directoryName;
-				first = FALSE;
-			}
-			else
-			{
-				DBG1(DBG_LIB, "more than one directory name - first selected");
-				directoryName->destroy(directoryName);
-			}
+			*name = directoryName;
+			first = FALSE;
 		}
-		iterator->destroy(iterator);
+		else
+		{
+			DBG1(DBG_ASN, "more than one directory name - first selected");
+			directoryName->destroy(directoryName);
+			break;
+		}
 	}
-	else
-	{
-		DBG1(DBG_LIB, "no directoryName found");
-	}
-
+	enumerator->destroy(enumerator);
 	list->destroy(list);
-	return has_directoryName;
+
+	if (first)
+	{
+		DBG1(DBG_ASN, "no directoryName found");
+		return FALSE;
+	}
+	return TRUE;
 }
 
 /**
@@ -244,63 +256,131 @@ static void parse_roleSyntax(chunk_t blob, int level0)
 }
 
 /**
+ * ASN.1 definition of ietfAttrSyntax
+ */
+static const asn1Object_t ietfAttrSyntaxObjects[] =
+{
+	{ 0, "ietfAttrSyntax",		ASN1_SEQUENCE,		ASN1_NONE }, /*  0 */
+	{ 1,   "policyAuthority",	ASN1_CONTEXT_C_0,	ASN1_OPT |
+													ASN1_BODY }, /*  1 */
+	{ 1,   "end opt",			ASN1_EOC,			ASN1_END  }, /*  2 */
+	{ 1,   "values",			ASN1_SEQUENCE,		ASN1_LOOP }, /*  3 */
+	{ 2,     "octets",			ASN1_OCTET_STRING,	ASN1_OPT |
+													ASN1_BODY }, /*  4 */
+	{ 2,     "end choice",		ASN1_EOC,			ASN1_END  }, /*  5 */
+	{ 2,     "oid",				ASN1_OID,			ASN1_OPT |
+													ASN1_BODY }, /*  6 */
+	{ 2,     "end choice",		ASN1_EOC,			ASN1_END  }, /*  7 */
+	{ 2,     "string",			ASN1_UTF8STRING,	ASN1_OPT |
+													ASN1_BODY }, /*  8 */
+	{ 2,     "end choice",		ASN1_EOC,			ASN1_END  }, /*  9 */
+	{ 1,   "end loop",			ASN1_EOC,			ASN1_END  }, /* 10 */
+	{ 0, "exit",				ASN1_EOC,			ASN1_EXIT }
+};
+#define IETF_ATTR_OCTETS	 4
+#define IETF_ATTR_OID		 6
+#define IETF_ATTR_STRING	 8
+
+/**
+ * Parse group memberships, IETF attributes
+ */
+static bool parse_groups(private_x509_ac_t *this, chunk_t encoded, int level0)
+{
+	ac_group_type_t type;
+	group_t *group;
+	asn1_parser_t *parser;
+	chunk_t object;
+	int objectID;
+	bool success;
+
+	parser = asn1_parser_create(ietfAttrSyntaxObjects, encoded);
+	parser->set_top_level(parser, level0);
+	while (parser->iterate(parser, &objectID, &object))
+	{
+		switch (objectID)
+		{
+			case IETF_ATTR_OCTETS:
+				type = AC_GROUP_TYPE_OCTETS;
+				break;
+			case IETF_ATTR_OID:
+				type = AC_GROUP_TYPE_OID;
+				break;
+			case IETF_ATTR_STRING:
+				type = AC_GROUP_TYPE_STRING;
+				break;
+			default:
+				continue;
+		}
+		INIT(group,
+			.type = type,
+			.value = chunk_clone(object),
+		);
+		this->groups->insert_last(this->groups, group);
+	}
+	success = parser->success(parser);
+	parser->destroy(parser);
+
+	return success;
+}
+
+/**
  * ASN.1 definition of an X509 attribute certificate
  */
 static const asn1Object_t acObjects[] =
 {
 	{ 0, "AttributeCertificate",			ASN1_SEQUENCE,		  ASN1_OBJ  }, /*  0 */
 	{ 1,   "AttributeCertificateInfo",		ASN1_SEQUENCE,		  ASN1_OBJ  }, /*  1 */
-	{ 2,	   "version",					ASN1_INTEGER,		  ASN1_DEF |
+	{ 2,       "version",					ASN1_INTEGER,		  ASN1_DEF |
 																  ASN1_BODY }, /*  2 */
-	{ 2,	   "holder",					ASN1_SEQUENCE,		  ASN1_NONE }, /*  3 */
-	{ 3,	     "baseCertificateID",		ASN1_CONTEXT_C_0,	  ASN1_OPT  }, /*  4 */
-	{ 4,	       "issuer",				ASN1_SEQUENCE,		  ASN1_OBJ  }, /*  5 */
-	{ 4,	       "serial",				ASN1_INTEGER,		  ASN1_BODY }, /*  6 */
+	{ 2,       "holder",					ASN1_SEQUENCE,		  ASN1_NONE }, /*  3 */
+	{ 3,         "baseCertificateID",		ASN1_CONTEXT_C_0,	  ASN1_OPT  }, /*  4 */
+	{ 4,           "issuer",				ASN1_SEQUENCE,		  ASN1_OBJ  }, /*  5 */
+	{ 4,           "serial",				ASN1_INTEGER,		  ASN1_BODY }, /*  6 */
 	{ 4,         "issuerUID",				ASN1_BIT_STRING,	  ASN1_OPT |
 																  ASN1_BODY }, /*  7 */
 	{ 4,         "end opt",					ASN1_EOC,			  ASN1_END  }, /*  8 */
 	{ 3,       "end opt",					ASN1_EOC,			  ASN1_END  }, /*  9 */
-	{ 3,	   "entityName",				ASN1_CONTEXT_C_1,	  ASN1_OPT |
+	{ 3,       "entityName",				ASN1_CONTEXT_C_1,	  ASN1_OPT |
 																  ASN1_OBJ  }, /* 10 */
 	{ 3,       "end opt",					ASN1_EOC,			  ASN1_END  }, /* 11 */
-	{ 3,	     "objectDigestInfo",		ASN1_CONTEXT_C_2,	  ASN1_OPT  }, /* 12 */
-	{ 4,	       "digestedObjectType",	ASN1_ENUMERATED,	  ASN1_BODY }, /* 13 */
-	{ 4,	       "otherObjectTypeID",		ASN1_OID,			  ASN1_OPT |
+	{ 3,         "objectDigestInfo",		ASN1_CONTEXT_C_2,	  ASN1_OPT  }, /* 12 */
+	{ 4,           "digestedObjectType",	ASN1_ENUMERATED,	  ASN1_BODY }, /* 13 */
+	{ 4,           "otherObjectTypeID",		ASN1_OID,			  ASN1_OPT |
 																  ASN1_BODY }, /* 14 */
 	{ 4,         "end opt",					ASN1_EOC,			  ASN1_END  }, /* 15 */
 	{ 4,         "digestAlgorithm",			ASN1_EOC,			  ASN1_RAW  }, /* 16 */
 	{ 3,       "end opt",					ASN1_EOC,			  ASN1_END  }, /* 17 */
-	{ 2,	   "v2Form",					ASN1_CONTEXT_C_0,	  ASN1_NONE }, /* 18 */
-	{ 3,	     "issuerName",				ASN1_SEQUENCE,		  ASN1_OPT |
+	{ 2,       "v2Form",					ASN1_CONTEXT_C_0,	  ASN1_NONE }, /* 18 */
+	{ 3,         "issuerName",				ASN1_SEQUENCE,		  ASN1_OPT |
 																  ASN1_OBJ  }, /* 19 */
 	{ 3,       "end opt",					ASN1_EOC,			  ASN1_END  }, /* 20 */
-	{ 3,	     "baseCertificateID",		ASN1_CONTEXT_C_0,	  ASN1_OPT  }, /* 21 */
-	{ 4,	       "issuerSerial",			ASN1_SEQUENCE,		  ASN1_NONE }, /* 22 */
-	{ 5,	         "issuer",				ASN1_SEQUENCE,		  ASN1_OBJ  }, /* 23 */
-	{ 5,		 "serial",					ASN1_INTEGER,		  ASN1_BODY }, /* 24 */
+	{ 3,         "baseCertificateID",		ASN1_CONTEXT_C_0,	  ASN1_OPT  }, /* 21 */
+	{ 4,           "issuerSerial",			ASN1_SEQUENCE,		  ASN1_NONE }, /* 22 */
+	{ 5,             "issuer",				ASN1_SEQUENCE,		  ASN1_OBJ  }, /* 23 */
+	{ 5,         "serial",					ASN1_INTEGER,		  ASN1_BODY }, /* 24 */
 	{ 5,           "issuerUID",				ASN1_BIT_STRING,	  ASN1_OPT |
 																  ASN1_BODY }, /* 25 */
 	{ 5,           "end opt",				ASN1_EOC,			  ASN1_END  }, /* 26 */
 	{ 3,       "end opt",					ASN1_EOC,			  ASN1_END  }, /* 27 */
 	{ 3,       "objectDigestInfo",			ASN1_CONTEXT_C_1,	  ASN1_OPT  }, /* 28 */
-	{ 4,	       "digestInfo",			ASN1_SEQUENCE,		  ASN1_OBJ  }, /* 29 */
-	{ 5,  	 "digestedObjectType",			ASN1_ENUMERATED,	  ASN1_BODY }, /* 30 */
-	{ 5,		 "otherObjectTypeID",		ASN1_OID,			  ASN1_OPT |
+	{ 4,           "digestInfo",			ASN1_SEQUENCE,		  ASN1_OBJ  }, /* 29 */
+	{ 5,     "digestedObjectType",			ASN1_ENUMERATED,	  ASN1_BODY }, /* 30 */
+	{ 5,         "otherObjectTypeID",		ASN1_OID,			  ASN1_OPT |
 																  ASN1_BODY }, /* 31 */
 	{ 5,           "end opt",				ASN1_EOC,			  ASN1_END  }, /* 32 */
 	{ 5,           "digestAlgorithm",		ASN1_EOC,			  ASN1_RAW  }, /* 33 */
 	{ 3,       "end opt",					ASN1_EOC,			  ASN1_END  }, /* 34 */
-	{ 2,	   "signature",					ASN1_EOC,			  ASN1_RAW  }, /* 35 */
-	{ 2,	   "serialNumber",				ASN1_INTEGER,		  ASN1_BODY }, /* 36 */
-	{ 2,	   "attrCertValidityPeriod",	ASN1_SEQUENCE,		  ASN1_NONE }, /* 37 */
-	{ 3,	     "notBeforeTime",			ASN1_GENERALIZEDTIME, ASN1_BODY }, /* 38 */
-	{ 3,	     "notAfterTime",			ASN1_GENERALIZEDTIME, ASN1_BODY }, /* 39 */
-	{ 2,	   "attributes",				ASN1_SEQUENCE,		  ASN1_LOOP }, /* 40 */
+	{ 2,       "signature",					ASN1_EOC,			  ASN1_RAW  }, /* 35 */
+	{ 2,       "serialNumber",				ASN1_INTEGER,		  ASN1_BODY }, /* 36 */
+	{ 2,       "attrCertValidityPeriod",	ASN1_SEQUENCE,		  ASN1_NONE }, /* 37 */
+	{ 3,         "notBeforeTime",			ASN1_GENERALIZEDTIME, ASN1_BODY }, /* 38 */
+	{ 3,         "notAfterTime",			ASN1_GENERALIZEDTIME, ASN1_BODY }, /* 39 */
+	{ 2,       "attributes",				ASN1_SEQUENCE,		  ASN1_LOOP }, /* 40 */
 	{ 3,       "attribute",					ASN1_SEQUENCE,		  ASN1_NONE }, /* 41 */
 	{ 4,         "type",					ASN1_OID,			  ASN1_BODY }, /* 42 */
 	{ 4,         "values",					ASN1_SET, 			  ASN1_LOOP }, /* 43 */
 	{ 5,           "value",					ASN1_EOC, 			  ASN1_RAW  }, /* 44 */
-	{ 4, 	       "end loop",				ASN1_EOC,			  ASN1_END  }, /* 45 */
+	{ 4,           "end loop",				ASN1_EOC,			  ASN1_END  }, /* 45 */
 	{ 2,     "end loop",					ASN1_EOC,			  ASN1_END  }, /* 46 */
 	{ 2,     "extensions",					ASN1_SEQUENCE,		  ASN1_LOOP }, /* 47 */
 	{ 3,       "extension",					ASN1_SEQUENCE,		  ASN1_NONE }, /* 48 */
@@ -359,31 +439,35 @@ static bool parse_certificate(private_x509_ac_t *this)
 				break;
 			case AC_OBJ_VERSION:
 				this->version = (object.len) ? (1 + (u_int)*object.ptr) : 1;
-				DBG2(DBG_LIB, "  v%d", this->version);
+				DBG2(DBG_ASN, "  v%d", this->version);
 				if (this->version != 2)
 				{
-					DBG1(DBG_LIB, "v%d attribute certificates are not "
+					DBG1(DBG_ASN, "v%d attribute certificates are not "
 						 "supported", this->version);
 					goto end;
 				}
 				break;
 			case AC_OBJ_HOLDER_ISSUER:
-				if (!parse_directoryName(object, level, FALSE, &this->holderIssuer))
+				if (!parse_directoryName(object, level, FALSE,
+										 &this->holderIssuer))
 				{
 					goto end;
 				}
 				break;
 			case AC_OBJ_HOLDER_SERIAL:
-				this->holderSerial = object;
+				this->holderSerial = identification_create_from_encoding(
+															ID_KEY_ID, object);
 				break;
 			case AC_OBJ_ENTITY_NAME:
-				if (!parse_directoryName(object, level, TRUE, &this->entityName))
+				if (!parse_directoryName(object, level, TRUE,
+										 &this->entityName))
 				{
 					goto end;
 				}
 				break;
 			case AC_OBJ_ISSUER_NAME:
-				if (!parse_directoryName(object, level, FALSE, &this->issuerName))
+				if (!parse_directoryName(object, level, FALSE,
+										 &this->issuerName))
 				{
 					goto end;
 				}
@@ -408,20 +492,21 @@ static bool parse_certificate(private_x509_ac_t *this)
 				switch (type)
 				{
 					case OID_AUTHENTICATION_INFO:
-						DBG2(DBG_LIB, "  need to parse authenticationInfo");
+						DBG2(DBG_ASN, "  need to parse authenticationInfo");
 						break;
 					case OID_ACCESS_IDENTITY:
-						DBG2(DBG_LIB, "  need to parse accessIdentity");
+						DBG2(DBG_ASN, "  need to parse accessIdentity");
 						break;
 					case OID_CHARGING_IDENTITY:
-						DBG2(DBG_LIB, "-- > --");
-						this->charging = ietf_attributes_create_from_encoding(object);
-						DBG2(DBG_LIB, "-- < --");
+						DBG2(DBG_ASN, "  need to parse chargingIdentity");
 						break;
 					case OID_GROUP:
-						DBG2(DBG_LIB, "-- > --");
-						this->groups = ietf_attributes_create_from_encoding(object);
-						DBG2(DBG_LIB, "-- < --");
+						DBG2(DBG_ASN, "-- > --");
+						if (!parse_groups(this, object, level))
+						{
+							goto end;
+						}
+						DBG2(DBG_ASN, "-- < --");
 						break;
 					case OID_ROLE:
 						parse_roleSyntax(object, level);
@@ -436,21 +521,22 @@ static bool parse_certificate(private_x509_ac_t *this)
 				break;
 			case AC_OBJ_CRITICAL:
 				critical = object.len && *object.ptr;
-				DBG2(DBG_LIB, "  %s",(critical)?"TRUE":"FALSE");
+				DBG2(DBG_ASN, "  %s",(critical)?"TRUE":"FALSE");
 				break;
 			case AC_OBJ_EXTN_VALUE:
 			{
 				switch (extn_oid)
 				{
 					case OID_CRL_DISTRIBUTION_POINTS:
-						DBG2(DBG_LIB, "  need to parse crlDistributionPoints");
+						DBG2(DBG_ASN, "  need to parse crlDistributionPoints");
 						break;
 					case OID_AUTHORITY_KEY_ID:
-						this->authKeyIdentifier = x509_parse_authorityKeyIdentifier(object,
-													level, &this->authKeySerialNumber);
+						this->authKeyIdentifier =
+								x509_parse_authorityKeyIdentifier(object,
+											level, &this->authKeySerialNumber);
 						break;
 					case OID_TARGET_INFORMATION:
-						DBG2(DBG_LIB, "  need to parse targetInformation");
+						DBG2(DBG_ASN, "  need to parse targetInformation");
 						break;
 					case OID_NO_REV_AVAIL:
 						this->noRevAvail = TRUE;
@@ -465,13 +551,13 @@ static bool parse_certificate(private_x509_ac_t *this)
 																 NULL);
 				if (this->algorithm != sig_alg)
 				{
-					DBG1(DBG_LIB, "  signature algorithms do not agree");
+					DBG1(DBG_ASN, "  signature algorithms do not agree");
 					success = FALSE;
 					goto end;
 				}
 				break;
 			case AC_OBJ_SIGNATURE:
-				this->signature = object;
+				this->signature = chunk_skip(object, 1);
 				break;
 			default:
 				break;
@@ -490,7 +576,7 @@ end:
 static chunk_t build_directoryName(asn1_t tag, chunk_t name)
 {
 	return asn1_wrap(tag, "m",
-		asn1_simple_object(ASN1_CONTEXT_C_4, name));
+				asn1_simple_object(ASN1_CONTEXT_C_4, name));
 }
 
 /**
@@ -499,14 +585,15 @@ static chunk_t build_directoryName(asn1_t tag, chunk_t name)
 static chunk_t build_holder(private_x509_ac_t *this)
 {
 	x509_t* x509 = (x509_t*)this->holderCert;
-	identification_t *issuer = this->holderCert->get_issuer(this->holderCert);
-	identification_t *subject = this->holderCert->get_subject(this->holderCert);
+	identification_t *issuer, *subject;
+
+	issuer = this->holderCert->get_issuer(this->holderCert);
+	subject = this->holderCert->get_subject(this->holderCert);
 
 	return asn1_wrap(ASN1_SEQUENCE, "mm",
 		asn1_wrap(ASN1_CONTEXT_C_0, "mm",
 			build_directoryName(ASN1_SEQUENCE, issuer->get_encoding(issuer)),
-			asn1_simple_object(ASN1_INTEGER, x509->get_serial(x509))
-		),
+			asn1_simple_object(ASN1_INTEGER, x509->get_serial(x509))),
 		build_directoryName(ASN1_CONTEXT_C_1, subject->get_encoding(subject)));
 }
 
@@ -515,10 +602,12 @@ static chunk_t build_holder(private_x509_ac_t *this)
  */
 static chunk_t build_v2_form(private_x509_ac_t *this)
 {
-	identification_t *subject = this->signerCert->get_subject(this->signerCert);
+	identification_t *subject;
 
+	subject = this->signerCert->get_subject(this->signerCert);
 	return asn1_wrap(ASN1_CONTEXT_C_0, "m",
-		build_directoryName(ASN1_SEQUENCE, subject->get_encoding(subject)));
+				build_directoryName(ASN1_SEQUENCE,
+					subject->get_encoding(subject)));
 }
 
 /**
@@ -528,9 +617,8 @@ static chunk_t build_attr_cert_validity(private_x509_ac_t *this)
 {
 	return asn1_wrap(ASN1_SEQUENCE, "mm",
 				asn1_from_time(&this->notBefore, ASN1_GENERALIZEDTIME),
-				asn1_from_time(&this->notAfter,  ASN1_GENERALIZEDTIME));
+				asn1_from_time(&this->notAfter, ASN1_GENERALIZEDTIME));
 }
-
 
 /**
  * build attribute type
@@ -547,8 +635,55 @@ static chunk_t build_attribute_type(int type, chunk_t content)
  */
 static chunk_t build_attributes(private_x509_ac_t *this)
 {
+	enumerator_t *enumerator;
+	group_t *group;
+	chunk_t values;
+	size_t size = 0, len;
+	u_char *pos;
+
+	/* precalculate the total size of all values */
+	enumerator = this->groups->create_enumerator(this->groups);
+	while (enumerator->enumerate(enumerator, &group))
+	{
+		len = group->value.len;
+		size += 1 + (len > 0) + (len >= 128) +
+				(len >= 256) + (len >= 65536) + len;
+	}
+	enumerator->destroy(enumerator);
+
+	pos = asn1_build_object(&values, ASN1_SEQUENCE, size);
+
+	enumerator = this->groups->create_enumerator(this->groups);
+	while (enumerator->enumerate(enumerator, &group))
+	{
+		chunk_t attr;
+		asn1_t type;
+
+		switch (group->type)
+		{
+			case AC_GROUP_TYPE_OCTETS:
+				type = ASN1_OCTET_STRING;
+				break;
+			case AC_GROUP_TYPE_STRING:
+				type = ASN1_UTF8STRING;
+				break;
+			case AC_GROUP_TYPE_OID:
+				type = ASN1_OID;
+				break;
+			default:
+				continue;
+		}
+		attr = asn1_simple_object(type, group->value);
+
+		memcpy(pos, attr.ptr, attr.len);
+		pos += attr.len;
+		free(attr.ptr);
+	}
+	enumerator->destroy(enumerator);
+
 	return asn1_wrap(ASN1_SEQUENCE, "m",
-		build_attribute_type(OID_GROUP, this->groups->get_encoding(this->groups)));
+				build_attribute_type(OID_GROUP,
+					asn1_wrap(ASN1_SEQUENCE, "m", values)));
 }
 
 /**
@@ -616,104 +751,122 @@ static chunk_t build_attr_cert_info(private_x509_ac_t *this)
 				build_extensions(this));
 }
 
-
 /**
  * build an X.509 attribute certificate
  */
-static chunk_t build_ac(private_x509_ac_t *this)
+static bool build_ac(private_x509_ac_t *this)
 {
-	chunk_t signatureValue;
-	chunk_t attributeCertificateInfo;
+	chunk_t signatureValue, attributeCertificateInfo;
 
 	attributeCertificateInfo = build_attr_cert_info(this);
-
-	this->signerKey->sign(this->signerKey, SIGN_RSA_EMSA_PKCS1_SHA1,
-						  attributeCertificateInfo, &signatureValue);
-
-	return asn1_wrap(ASN1_SEQUENCE, "mmm",
-				attributeCertificateInfo,
-				asn1_algorithmIdentifier(OID_SHA1_WITH_RSA),
-				asn1_bitstring("m", signatureValue));
+	if (!this->signerKey->sign(this->signerKey, SIGN_RSA_EMSA_PKCS1_SHA1,
+							   attributeCertificateInfo, &signatureValue))
+	{
+		free(attributeCertificateInfo.ptr);
+		return FALSE;
+	}
+	this->encoding = asn1_wrap(ASN1_SEQUENCE, "mmm",
+						attributeCertificateInfo,
+						asn1_algorithmIdentifier(OID_SHA1_WITH_RSA),
+						asn1_bitstring("m", signatureValue));
+	return TRUE;
 }
 
-/**
- * Implementation of ac_t.get_serial.
- */
-static chunk_t get_serial(private_x509_ac_t *this)
+METHOD(ac_t, get_serial, chunk_t,
+	private_x509_ac_t *this)
 {
 	return this->serialNumber;
 }
 
-/**
- * Implementation of ac_t.get_holderSerial.
- */
-static chunk_t get_holderSerial(private_x509_ac_t *this)
+METHOD(ac_t, get_holderSerial, chunk_t,
+	private_x509_ac_t *this)
 {
-	return this->holderSerial;
+	if (this->holderSerial)
+	{
+		return this->holderSerial->get_encoding(this->holderSerial);
+	}
+	return chunk_empty;
 }
 
-/**
- * Implementation of ac_t.get_holderIssuer.
- */
-static identification_t* get_holderIssuer(private_x509_ac_t *this)
+METHOD(ac_t, get_holderIssuer, identification_t*,
+	private_x509_ac_t *this)
 {
 	return this->holderIssuer;
 }
 
-/**
- * Implementation of ac_t.get_authKeyIdentifier.
- */
-static chunk_t get_authKeyIdentifier(private_x509_ac_t *this)
+METHOD(ac_t, get_authKeyIdentifier, chunk_t,
+	private_x509_ac_t *this)
 {
 	return this->authKeyIdentifier;
 }
 
 /**
- * Implementation of certificate_t.get_groups.
+ * Filter function for attribute enumeration
  */
-static ietf_attributes_t* get_groups(private_x509_ac_t *this)
+static bool attr_filter(void *null, group_t **in, ac_group_type_t *type,
+						void *in2, chunk_t *out)
 {
-	return this->groups ? this->groups->get_ref(this->groups) : NULL;
+	if ((*in)->type == AC_GROUP_TYPE_STRING &&
+		!chunk_printable((*in)->value, NULL, 0))
+	{	/* skip non-printable strings */
+		return FALSE;
+	}
+	*type = (*in)->type;
+	*out = (*in)->value;
+	return TRUE;
 }
 
-/**
- * Implementation of certificate_t.get_type
- */
-static certificate_type_t get_type(private_x509_ac_t *this)
+METHOD(ac_t, create_group_enumerator, enumerator_t*,
+	private_x509_ac_t *this)
+{
+	return enumerator_create_filter(
+							this->groups->create_enumerator(this->groups),
+							(void*)attr_filter, NULL, NULL);
+}
+
+METHOD(certificate_t, get_type, certificate_type_t,
+	private_x509_ac_t *this)
 {
 	return CERT_X509_AC;
 }
 
-/**
- * Implementation of certificate_t.get_subject
- */
-static identification_t* get_subject(private_x509_ac_t *this)
+METHOD(certificate_t, get_subject, identification_t*,
+	private_x509_ac_t *this)
 {
-	return this->entityName;
+	if (this->entityName)
+	{
+		return this->entityName;
+	}
+	return this->holderSerial;
 }
 
-/**
- * Implementation of certificate_t.get_issuer
- */
-static identification_t* get_issuer(private_x509_ac_t *this)
+METHOD(certificate_t, get_issuer, identification_t*,
+	private_x509_ac_t *this)
 {
 	return this->issuerName;
 }
 
-/**
- * Implementation of certificate_t.has_subject.
- */
-static id_match_t has_subject(private_x509_ac_t *this, identification_t *subject)
+METHOD(certificate_t, has_subject, id_match_t,
+	private_x509_ac_t *this, identification_t *subject)
 {
-	return ID_MATCH_NONE;
+	id_match_t entity = ID_MATCH_NONE, serial = ID_MATCH_NONE;
+
+	if (this->entityName)
+	{
+		entity = this->entityName->matches(this->entityName, subject);
+	}
+	if (this->holderSerial)
+	{
+		serial = this->holderSerial->matches(this->holderSerial, subject);
+	}
+	return max(entity, serial);
 }
 
-/**
- * Implementation of certificate_t.has_issuer.
- */
-static id_match_t has_issuer(private_x509_ac_t *this, identification_t *issuer)
+METHOD(certificate_t, has_issuer, id_match_t,
+	private_x509_ac_t *this, identification_t *issuer)
 {
-	if (issuer->get_type(issuer) == ID_KEY_ID && this->authKeyIdentifier.ptr &&
+	if (issuer->get_type(issuer) == ID_KEY_ID &&
+		this->authKeyIdentifier.ptr &&
 		chunk_equals(this->authKeyIdentifier, issuer->get_encoding(issuer)))
 	{
 		return ID_MATCH_PERFECT;
@@ -721,10 +874,8 @@ static id_match_t has_issuer(private_x509_ac_t *this, identification_t *issuer)
 	return this->issuerName->matches(this->issuerName, issuer);
 }
 
-/**
- * Implementation of certificate_t.issued_by
- */
-static bool issued_by(private_x509_ac_t *this, certificate_t *issuer)
+METHOD(certificate_t, issued_by, bool,
+	private_x509_ac_t *this, certificate_t *issuer, signature_scheme_t *schemep)
 {
 	public_key_t *key;
 	signature_scheme_t scheme;
@@ -773,31 +924,28 @@ static bool issued_by(private_x509_ac_t *this, certificate_t *issuer)
 	}
 	valid = key->verify(key, scheme, this->certificateInfo, this->signature);
 	key->destroy(key);
+	if (valid && schemep)
+	{
+		*schemep = scheme;
+	}
 	return valid;
 }
 
-/**
- * Implementation of certificate_t.get_public_key.
- */
-static public_key_t* get_public_key(private_x509_ac_t *this)
+METHOD(certificate_t, get_public_key, public_key_t*,
+	private_x509_ac_t *this)
 {
 	return NULL;
 }
 
-/**
- * Implementation of certificate_t.get_ref.
- */
-static private_x509_ac_t* get_ref(private_x509_ac_t *this)
+METHOD(certificate_t, get_ref, certificate_t*,
+	private_x509_ac_t *this)
 {
 	ref_get(&this->ref);
-	return this;
+	return &this->public.interface.certificate;
 }
 
-/**
- * Implementation of certificate_t.get_validity.
- */
-static bool get_validity(private_x509_ac_t *this, time_t *when,
-						 time_t *not_before, time_t *not_after)
+METHOD(certificate_t, get_validity, bool,
+	private_x509_ac_t *this, time_t *when, time_t *not_before, time_t *not_after)
 {
 	time_t t = when ? *when : time(NULL);
 
@@ -812,11 +960,8 @@ static bool get_validity(private_x509_ac_t *this, time_t *when,
 	return (t >= this->notBefore && t <= this->notAfter);
 }
 
-/**
- * Implementation of certificate_t.get_encoding.
- */
-static bool get_encoding(private_x509_ac_t *this, cred_encoding_type_t type,
-						 chunk_t *encoding)
+METHOD(certificate_t, get_encoding, bool,
+	private_x509_ac_t *this, cred_encoding_type_t type, chunk_t *encoding)
 {
 	if (type == CERT_ASN1_DER)
 	{
@@ -827,10 +972,8 @@ static bool get_encoding(private_x509_ac_t *this, cred_encoding_type_t type,
 					CRED_PART_X509_AC_ASN1_DER, this->encoding, CRED_PART_END);
 }
 
-/**
- * Implementation of certificate_t.equals.
- */
-static bool equals(private_x509_ac_t *this, certificate_t *other)
+METHOD(certificate_t, equals, bool,
+	private_x509_ac_t *this, certificate_t *other)
 {
 	chunk_t encoding;
 	bool equal;
@@ -839,9 +982,10 @@ static bool equals(private_x509_ac_t *this, certificate_t *other)
 	{
 		return TRUE;
 	}
-	if (other->equals == (void*)equals)
+	if (other->equals == _equals)
 	{	/* skip allocation if we have the same implementation */
-		return chunk_equals(this->encoding, ((private_x509_ac_t*)other)->encoding);
+		return chunk_equals(this->encoding,
+							((private_x509_ac_t*)other)->encoding);
 	}
 	if (!other->get_encoding(other, CERT_ASN1_DER, &encoding))
 	{
@@ -852,21 +996,19 @@ static bool equals(private_x509_ac_t *this, certificate_t *other)
 	return equal;
 }
 
-/**
- * Implementation of x509_ac_t.destroy
- */
-static void destroy(private_x509_ac_t *this)
+METHOD(certificate_t, destroy, void,
+	private_x509_ac_t *this)
 {
 	if (ref_put(&this->ref))
 	{
 		DESTROY_IF(this->holderIssuer);
+		DESTROY_IF(this->holderSerial);
 		DESTROY_IF(this->entityName);
 		DESTROY_IF(this->issuerName);
 		DESTROY_IF(this->holderCert);
 		DESTROY_IF(this->signerCert);
 		DESTROY_IF(this->signerKey);
-		DESTROY_IF(this->charging);
-		DESTROY_IF(this->groups);
+		this->groups->destroy_function(this->groups, (void*)group_destroy);
 		free(this->serialNumber.ptr);
 		free(this->authKeyIdentifier.ptr);
 		free(this->encoding.ptr);
@@ -879,41 +1021,35 @@ static void destroy(private_x509_ac_t *this)
  */
 static private_x509_ac_t *create_empty(void)
 {
-	private_x509_ac_t *this = malloc_thing(private_x509_ac_t);
+	private_x509_ac_t *this;
 
-	/* public functions */
-	this->public.interface.get_serial = (chunk_t (*)(ac_t*))get_serial;
-	this->public.interface.get_holderSerial = (chunk_t (*)(ac_t*))get_holderSerial;
-	this->public.interface.get_holderIssuer = (identification_t* (*)(ac_t*))get_holderIssuer;
-	this->public.interface.get_authKeyIdentifier = (chunk_t (*)(ac_t*))get_authKeyIdentifier;
-	this->public.interface.get_groups = (ietf_attributes_t* (*)(ac_t*))get_groups;
-	this->public.interface.certificate.get_type = (certificate_type_t (*)(certificate_t *this))get_type;
-	this->public.interface.certificate.get_subject = (identification_t* (*)(certificate_t *this))get_subject;
-	this->public.interface.certificate.get_issuer = (identification_t* (*)(certificate_t *this))get_issuer;
-	this->public.interface.certificate.has_subject = (id_match_t(*)(certificate_t*, identification_t *subject))has_subject;
-	this->public.interface.certificate.has_issuer = (id_match_t(*)(certificate_t*, identification_t *issuer))has_issuer;
-	this->public.interface.certificate.issued_by = (bool (*)(certificate_t *this, certificate_t *issuer))issued_by;
-	this->public.interface.certificate.get_public_key = (public_key_t* (*)(certificate_t *this))get_public_key;
-	this->public.interface.certificate.get_validity = (bool(*)(certificate_t*, time_t *when, time_t *, time_t*))get_validity;
-	this->public.interface.certificate.get_encoding = (bool(*)(certificate_t*,cred_encoding_type_t,chunk_t*))get_encoding;
-	this->public.interface.certificate.equals = (bool(*)(certificate_t*, certificate_t *other))equals;
-	this->public.interface.certificate.get_ref = (certificate_t* (*)(certificate_t *this))get_ref;
-	this->public.interface.certificate.destroy = (void (*)(certificate_t *this))destroy;
-
-	/* initialize */
-	this->encoding = chunk_empty;
-	this->serialNumber = chunk_empty;
-	this->holderSerial = chunk_empty;
-	this->authKeyIdentifier = chunk_empty;
-	this->holderIssuer = NULL;
-	this->entityName = NULL;
-	this->issuerName = NULL;
-	this->holderCert = NULL;
-	this->signerCert = NULL;
-	this->signerKey = NULL;
-	this->charging = NULL;
-	this->groups = NULL;
-	this->ref = 1;
+	INIT(this,
+		.public = {
+			.interface = {
+				.certificate = {
+					.get_type = _get_type,
+					.get_subject = _get_subject,
+					.get_issuer = _get_issuer,
+					.has_subject = _has_subject,
+					.has_issuer = _has_issuer,
+					.issued_by = _issued_by,
+					.get_public_key = _get_public_key,
+					.get_validity = _get_validity,
+					.get_encoding = _get_encoding,
+					.equals = _equals,
+					.get_ref = _get_ref,
+					.destroy = _destroy,
+				},
+				.get_serial = _get_serial,
+				.get_holderSerial = _get_holderSerial,
+				.get_holderIssuer = _get_holderIssuer,
+				.get_authKeyIdentifier = _get_authKeyIdentifier,
+				.create_group_enumerator = _create_group_enumerator,
+			},
+		},
+		.groups = linked_list_create(),
+		.ref = 1,
+	);
 
 	return this;
 }
@@ -954,6 +1090,27 @@ x509_ac_t *x509_ac_load(certificate_type_t type, va_list args)
 }
 
 /**
+ * Add groups from a list into AC group memberships
+ */
+static void add_groups_from_list(private_x509_ac_t *this, linked_list_t *list)
+{
+	enumerator_t *enumerator;
+	group_t *group;
+	char *name;
+
+	enumerator = list->create_enumerator(list);
+	while (enumerator->enumerate(enumerator, &name))
+	{
+		INIT(group,
+			.type = AC_GROUP_TYPE_STRING,
+			.value = chunk_clone(chunk_from_str(name)),
+		);
+		this->groups->insert_last(this->groups, group);
+	}
+	enumerator->destroy(enumerator);
+}
+
+/**
  * See header.
  */
 x509_ac_t *x509_ac_gen(certificate_type_t type, va_list args)
@@ -974,8 +1131,8 @@ x509_ac_t *x509_ac_gen(certificate_type_t type, va_list args)
 			case BUILD_SERIAL:
 				ac->serialNumber = chunk_clone(va_arg(args, chunk_t));
 				continue;
-			case BUILD_IETF_GROUP_ATTR:
-				ac->groups = ietf_attributes_create_from_string(va_arg(args, char*));
+			case BUILD_AC_GROUP_STRINGS:
+				add_groups_from_list(ac, va_arg(args, linked_list_t*));
 				continue;
 			case BUILD_CERT:
 				ac->holderCert = va_arg(args, certificate_t*);
@@ -1002,10 +1159,11 @@ x509_ac_t *x509_ac_gen(certificate_type_t type, va_list args)
 		ac->holderCert->get_type(ac->holderCert) == CERT_X509 &&
 		ac->signerCert->get_type(ac->signerCert) == CERT_X509)
 	{
-		ac->encoding = build_ac(ac);
-		return &ac->public;
+		if (build_ac(ac))
+		{
+			return &ac->public;
+		}
 	}
 	destroy(ac);
 	return NULL;
 }
-

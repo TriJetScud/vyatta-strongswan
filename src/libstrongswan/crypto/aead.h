@@ -1,4 +1,7 @@
 /*
+ * Copyright (C) 2013 Tobias Brunner
+ * Hochschule fuer Technik Rapperswil
+ *
  * Copyright (C) 2010 Martin Willi
  * Copyright (C) 2010 revosec AG
  *
@@ -26,6 +29,7 @@ typedef struct aead_t aead_t;
 #include <library.h>
 #include <crypto/crypters/crypter.h>
 #include <crypto/signers/signer.h>
+#include <crypto/iv/iv_gen.h>
 
 /**
  * Authenticated encryption / authentication decryption interface.
@@ -45,9 +49,10 @@ struct aead_t {
 	 * @param assoc			associated data to sign
 	 * @param iv			initialization vector
 	 * @param encrypted		allocated encryption result
+	 * @return				TRUE if successfully encrypted
 	 */
-	void (*encrypt)(aead_t *this, chunk_t plain, chunk_t assoc, chunk_t iv,
-					chunk_t *encrypted);
+	bool (*encrypt)(aead_t *this, chunk_t plain, chunk_t assoc, chunk_t iv,
+					chunk_t *encrypted) __attribute__((warn_unused_result));
 
 	/**
 	 * Decrypt and verify data, verify associated data.
@@ -57,7 +62,7 @@ struct aead_t {
 	 * is returned in the encrypted chunk, the last get_icv_size() bytes
 	 * contain the verified ICV.
 	 *
-	 * @param encrypted		data to encrypt and verify
+	 * @param encrypted		data to decrypt and verify
 	 * @param assoc			associated data to verify
 	 * @param iv			initialization vector
 	 * @param plain			allocated result, if successful
@@ -88,7 +93,18 @@ struct aead_t {
 	size_t (*get_iv_size)(aead_t *this);
 
 	/**
+	 * Get the IV generator implementation
+	 *
+	 * @return				IV generator
+	 */
+	iv_gen_t *(*get_iv_gen)(aead_t *this);
+
+	/**
 	 * Get the size of the key material (for encryption and authentication).
+	 *
+	 * This includes any additional bytes requires for the implicit nonce part.
+	 * For AEADs based on traditional ciphers, the length is for both
+	 * the integrity and the encryption key in total.
 	 *
 	 * @return				key size in bytes
 	 */
@@ -97,12 +113,19 @@ struct aead_t {
 	/**
 	 * Set the key for encryption and authentication.
 	 *
+	 * If the AEAD uses an implicit nonce, the last part of the key shall
+	 * be the implicit nonce. For AEADs based on traditional ciphers, the
+	 * key shall include both integrity and encryption keys, concatenated
+	 * in that order.
+	 *
 	 * @param key			encryption and authentication key
+	 * @return				TRUE if key set successfully
 	 */
-	void (*set_key)(aead_t *this, chunk_t key);
+	bool (*set_key)(aead_t *this,
+					chunk_t key) __attribute__((warn_unused_result));
 
 	/**
-	 * Destroy a aead_t.
+	 * Destroy an aead_t.
 	 */
 	void (*destroy)(aead_t *this);
 };
@@ -111,7 +134,7 @@ struct aead_t {
  * Create a aead instance using traditional transforms.
  *
  * @param crypter		encryption transform for this aead
- * @param signer		integrity tranform for this aead
+ * @param signer		integrity transform for this aead
  * @return				aead transform
  */
 aead_t *aead_create(crypter_t *crypter, signer_t *signer);

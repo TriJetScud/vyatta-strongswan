@@ -30,28 +30,39 @@ typedef struct notify_payload_t notify_payload_t;
 #include <library.h>
 #include <encoding/payloads/payload.h>
 #include <encoding/payloads/proposal_substructure.h>
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 
 /**
- * Notify payload length in bytes without any spi and notification data.
- */
-#define NOTIFY_PAYLOAD_HEADER_LENGTH 8
-
-/**
- * Notify message types.
- *
- * See IKEv2 RFC 3.10.1.
+ * Notify message types for IKEv2, and a subset for IKEv1.
  */
 enum notify_type_t {
 	/* notify error messages */
 	UNSUPPORTED_CRITICAL_PAYLOAD = 1,
+	/* IKEv1 alias */
+	INVALID_PAYLOAD_TYPE = 1,
 	INVALID_IKE_SPI = 4,
 	INVALID_MAJOR_VERSION = 5,
 	INVALID_SYNTAX = 7,
+	/* IKEv1 alias */
+	INVALID_EXCHANGE_TYPE = 7,
 	INVALID_MESSAGE_ID = 9,
 	INVALID_SPI = 11,
+	/* IKEv1 only */
+	ATTRIBUTES_NOT_SUPPORTED = 13,
+	/* IKEv1 alias */
 	NO_PROPOSAL_CHOSEN = 14,
+	/* IKEv1 only */
+	PAYLOAD_MALFORMED = 16,
 	INVALID_KE_PAYLOAD = 17,
+	/* IKEv1 alias */
+	INVALID_KEY_INFORMATION = 17,
+	/* IKEv1 only */
+	INVALID_ID_INFORMATION = 18,
+	INVALID_CERT_ENCODING = 19,
+	INVALID_CERTIFICATE = 20,
+	CERT_TYPE_UNSUPPORTED = 21,
+	INVALID_CERT_AUTHORITY = 22,
+	INVALID_HASH_INFORMATION = 23,
 	AUTHENTICATION_FAILED = 24,
 	SINGLE_PAIR_REQUIRED = 34,
 	NO_ADDITIONAL_SAS = 35,
@@ -70,6 +81,9 @@ enum notify_type_t {
 
 	/* IKE-ME, private use */
 	ME_CONNECT_FAILED = 8192,
+
+	/* Windows error code */
+	MS_NOTIFY_STATUS = 12345,
 
 	/* notify status messages */
 	INITIAL_CONTACT = 16384,
@@ -115,7 +129,35 @@ enum notify_type_t {
 	ROHC_SUPPORTED = 16416,
 	/* EAP-only authentication, RFC 5998 */
 	EAP_ONLY_AUTHENTICATION = 16417,
-
+	/* Childless initiation of IKEv2 SA, RFC 6023 */
+	CHILDLESS_IKEV2_SUPPORTED = 16418,
+	/* Quick crash detection for IKE, RFC 6290 */
+	QUICK_CRASH_DETECTION = 16419,
+	/* High availability of IKEv2/IPsec, RFC 6311 */
+	IKEV2_MESSAGE_ID_SYNC_SUPPORTED = 16420,
+	IKEV2_REPLAY_COUNTER_SYNC_SUPPORTED = 16421,
+	IKEV2_MESSAGE_ID_SYNC = 16422,
+	IPSEC_REPLAY_COUNTER_SYNC = 16423,
+	/* Secure password methods, RFC 6467 */
+	SECURE_PASSWORD_METHOD = 16424,
+	/* PACE, RFC 6631 */
+	PSK_PERSIST = 16425,
+	PSK_CONFIRM = 16426,
+	/* EAP Re-authentication Extension, RFC 6867 */
+	ERX_SUPPORTED = 16427,
+	/* IFOM capability, 3GPP TS 24.303, annex B.2 */
+	IFOM_CAPABILITY = 16428,
+	/* SENDER_REQUEST_ID (draft-yeung-g-ikev2) */
+	SENDER_REQUEST_ID = 16429,
+	/* IKEv2 fragmentation supported, RFC 7383 */
+	FRAGMENTATION_SUPPORTED = 16430,
+	/* IKEv1 initial contact */
+	INITIAL_CONTACT_IKEV1 = 24578,
+	/* IKEv1 DPD */
+	DPD_R_U_THERE = 36136,
+	DPD_R_U_THERE_ACK = 36137,
+	/* IKEv1 Cisco High Availability */
+	UNITY_LOAD_BALANCE = 40501,
 	/* BEET mode, not even a draft yet. private use */
 	USE_BEET_MODE = 40961,
 	/* IKE-ME, private use */
@@ -125,7 +167,9 @@ enum notify_type_t {
 	ME_CONNECTID = 40965,
 	ME_CONNECTKEY = 40966,
 	ME_CONNECTAUTH = 40967,
-	ME_RESPONSE = 40968
+	ME_RESPONSE = 40968,
+	/* RADIUS attribute received/to send to a AAA backend */
+	RADIUS_ATTRIBUTE = 40969,
 };
 
 /**
@@ -196,6 +240,24 @@ struct notify_payload_t {
 	void (*set_spi) (notify_payload_t *this, u_int32_t spi);
 
 	/**
+	 * Returns the currently set spi of this payload.
+	 *
+	 * This is only valid for notifys with protocol ISAKMP
+	 *
+	 * @return		SPI value
+	 */
+	chunk_t (*get_spi_data) (notify_payload_t *this);
+
+	/**
+	 * Sets the spi of this payload.
+	 *
+	 * This is only valid for notifys with protocol ISAKMP
+	 *
+	 * @param spi	SPI value
+	 */
+	void (*set_spi_data) (notify_payload_t *this, chunk_t spi);
+
+	/**
 	 * Returns the currently set notification data of payload.
 	 *
 	 * Returned data are not copied.
@@ -223,18 +285,20 @@ struct notify_payload_t {
 /**
  * Creates an empty notify_payload_t object
  *
+ * @param type		payload type, PLV2_NOTIFY or PLV1_NOTIFY
  * @return			created notify_payload_t object
  */
-notify_payload_t *notify_payload_create(void);
+notify_payload_t *notify_payload_create(payload_type_t type);
 
 /**
  * Creates an notify_payload_t object of specific type for specific protocol id.
  *
- * @param protocol_id			protocol id (IKE, AH or ESP)
- * @param type					notify type (see notify_type_t)
+ * @param type					payload type, PLV2_NOTIFY or PLV1_NOTIFY
+ * @param protocol				protocol id (IKE, AH or ESP)
+ * @param notify				type of notify
  * @return						notify_payload_t object
  */
 notify_payload_t *notify_payload_create_from_protocol_and_type(
-								protocol_id_t protocol_id, notify_type_t type);
+			payload_type_t type, protocol_id_t protocol, notify_type_t notify);
 
 #endif /** NOTIFY_PAYLOAD_H_ @}*/

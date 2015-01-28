@@ -27,8 +27,8 @@ typedef struct proposal_t proposal_t;
 
 #include <library.h>
 #include <utils/identification.h>
-#include <utils/linked_list.h>
-#include <utils/host.h>
+#include <collections/linked_list.h>
+#include <networking/host.h>
 #include <crypto/transform.h>
 #include <crypto/crypters/crypter.h>
 #include <crypto/signers/signer.h>
@@ -43,6 +43,7 @@ enum protocol_id_t {
 	PROTO_IKE = 1,
 	PROTO_AH = 2,
 	PROTO_ESP = 3,
+	PROTO_IPCOMP = 4, /* IKEv1 only */
 };
 
 /**
@@ -110,8 +111,10 @@ struct proposal_t {
 
 	/**
 	 * Strip DH groups from proposal to use it without PFS.
+	 *
+	 * @param keep			group to keep (MODP_NONE to remove all)
 	 */
-	void (*strip_dh)(proposal_t *this);
+	void (*strip_dh)(proposal_t *this, diffie_hellman_group_t keep);
 
 	/**
 	 * Compare two proposal, and select a matching subset.
@@ -120,7 +123,7 @@ struct proposal_t {
 	 * compared. If they have at least one algorithm of each type
 	 * in common, a resulting proposal of this kind is created.
 	 *
-	 * @param other			proposal to compair agains
+	 * @param other			proposal to compare against
 	 * @param private		accepts algorithms allocated in a private range
 	 * @return				selected proposal, NULL if proposals don't match
 	 */
@@ -180,7 +183,7 @@ struct proposal_t {
  *
  * @param protocol			protocol, such as PROTO_ESP
  * @param number			proposal number, as encoded in SA payload
- * @return 					proposal_t object
+ * @return					proposal_t object
  */
 proposal_t *proposal_create(protocol_id_t protocol, u_int number);
 
@@ -188,9 +191,17 @@ proposal_t *proposal_create(protocol_id_t protocol, u_int number);
  * Create a default proposal if nothing further specified.
  *
  * @param protocol			protocol, such as PROTO_ESP
- * @return 					proposal_t object
+ * @return					proposal_t object
  */
 proposal_t *proposal_create_default(protocol_id_t protocol);
+
+/**
+ * Create a default proposal for supported AEAD algorithms
+ *
+ * @param protocol			protocol, such as PROTO_ESP
+ * @return					proposal_t object, NULL if none supported
+ */
+proposal_t *proposal_create_default_aead(protocol_id_t protocol);
 
 /**
  * Create a proposal from a string identifying the algorithms.
@@ -203,7 +214,7 @@ proposal_t *proposal_create_default(protocol_id_t protocol);
  *
  * @param protocol			protocol, such as PROTO_ESP
  * @param algs				algorithms as string
- * @return 					proposal_t object
+ * @return					proposal_t object
  */
 proposal_t *proposal_create_from_string(protocol_id_t protocol, const char *algs);
 
@@ -215,7 +226,7 @@ proposal_t *proposal_create_from_string(protocol_id_t protocol, const char *algs
  * With the #-specifier, arguments are:
  *	linked_list_t *list containing proposal_t*
  */
-int proposal_printf_hook(char *dst, size_t len, printf_hook_spec_t *spec,
+int proposal_printf_hook(printf_hook_data_t *data, printf_hook_spec_t *spec,
 						 const void *const *args);
 
 #endif /** PROPOSAL_H_ @}*/

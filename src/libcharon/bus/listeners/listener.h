@@ -1,4 +1,5 @@
 /*
+ * Copyright (C) 2011-2014 Tobias Brunner
  * Copyright (C) 2009 Martin Willi
  * Hochschule fuer Technik Rapperswil
  *
@@ -31,26 +32,7 @@ typedef struct listener_t listener_t;
 struct listener_t {
 
 	/**
-	 * Log a debugging message.
-	 *
-	 * The implementing signal function returns TRUE to stay registered
-	 * to the bus, or FALSE to unregister itself.
-	 * Calling bus_t.log() inside of a registered listener is possible,
-	 * but the bus does not invoke listeners recursively.
-	 *
-	 * @param group		kind of the signal (up, down, rekeyed, ...)
-	 * @param level		verbosity level of the signal
-	 * @param thread	ID of the thread raised this signal
-	 * @param ike_sa	IKE_SA associated to the event
-	 * @param format	printf() style format string
-	 * @param args		vprintf() style va_list argument list
-	 * @return			TRUE to stay registered, FALSE to unregister
-	 */
-	bool (*log)(listener_t *this, debug_t group, level_t level, int thread,
-				ike_sa_t *ike_sa, char* format, va_list args);
-
-	/**
-	 * Hook called if a critical alert is risen.
+	 * Hook called if a critical alert is raised.
 	 *
 	 * @param ike_sa	IKE_SA associated to the alert, if any
 	 * @param alert		kind of alert
@@ -84,26 +66,33 @@ struct listener_t {
 	/**
 	 * Hook called for received/sent messages of an IKE_SA.
 	 *
-	 * @param ike_sa	IKE_SA sending/receving a message
+	 * The hook is invoked twice for each message: Once with plain, parsed data
+	 * and once encoded and encrypted.
+	 *
+	 * @param ike_sa	IKE_SA sending/receiving a message
 	 * @param message	message object
 	 * @param incoming	TRUE for incoming messages, FALSE for outgoing
+	 * @param plain		TRUE if message is parsed and decrypted, FALSE it not
 	 * @return			TRUE to stay registered, FALSE to unregister
 	 */
 	bool (*message)(listener_t *this, ike_sa_t *ike_sa, message_t *message,
-					bool incoming);
+					bool incoming, bool plain);
 
 	/**
 	 * Hook called with IKE_SA key material.
 	 *
 	 * @param ike_sa	IKE_SA this keymat belongs to
 	 * @param dh		diffie hellman shared secret
+	 * @param dh_other	others DH public value (IKEv1 only)
 	 * @param nonce_i	initiators nonce
 	 * @param nonce_r	responders nonce
-	 * @param rekey		IKE_SA we are rekeying, if any
+	 * @param rekey		IKE_SA we are rekeying, if any (IKEv2 only)
+	 * @param shared	shared key used for key derivation (IKEv1-PSK only)
 	 * @return			TRUE to stay registered, FALSE to unregister
 	 */
 	bool (*ike_keys)(listener_t *this, ike_sa_t *ike_sa, diffie_hellman_t *dh,
-					 chunk_t nonce_i, chunk_t nonce_r, ike_sa_t *rekey);
+					 chunk_t dh_other, chunk_t nonce_i, chunk_t nonce_r,
+					 ike_sa_t *rekey, shared_key_t *shared);
 
 	/**
 	 * Hook called with CHILD_SA key material.
@@ -137,6 +126,33 @@ struct listener_t {
 	 * @return			TRUE to stay registered, FALSE to unregister
 	 */
 	bool (*ike_rekey)(listener_t *this, ike_sa_t *old, ike_sa_t *new);
+
+	/**
+	 * Hook called when an initiator reestablishes an IKE_SA.
+	 *
+	 * This is invoked right after creating the new IKE_SA and setting the
+	 * peer_cfg (and the old hosts), but before resolving the hosts anew.
+	 * It is not invoked on the responder.
+	 *
+	 * @param old		IKE_SA getting reestablished (is destroyed)
+	 * @param new		new IKE_SA replacing old (gets established)
+	 * @return			TRUE to stay registered, FALSE to unregister
+	 */
+	bool (*ike_reestablish_pre)(listener_t *this, ike_sa_t *old, ike_sa_t *new);
+
+	/**
+	 * Hook called when an initiator reestablishes an IKE_SA.
+	 *
+	 * This is invoked right before the new IKE_SA is checked in after
+	 * initiating it.  It is not invoked on the responder.
+	 *
+	 * @param old		IKE_SA getting reestablished (is destroyed)
+	 * @param new		new IKE_SA replacing old (gets established)
+	 * @param initiated TRUE if initiation was successful, FALSE otherwise
+	 * @return			TRUE to stay registered, FALSE to unregister
+	 */
+	bool (*ike_reestablish_post)(listener_t *this, ike_sa_t *old,
+								 ike_sa_t *new, bool initiated);
 
 	/**
 	 * Hook called when a CHILD_SA gets up or down.
@@ -190,6 +206,31 @@ struct listener_t {
 	 */
 	bool (*narrow)(listener_t *this, ike_sa_t *ike_sa, child_sa_t *child_sa,
 				narrow_hook_t type, linked_list_t *local, linked_list_t *remote);
+
+	/**
+	 * Virtual IP address assignment hook.
+	 *
+	 * This hook gets invoked after virtual IPs have been assigned to a peer
+	 * for a specific IKE_SA, and again before they get released.
+	 *
+	 * @param ike_sa	IKE_SA the VIPs are assigned to
+	 * @param assign	TRUE if assigned to IKE_SA, FALSE if released
+	 * @return			TRUE to stay registered, FALSE to unregister
+	 */
+	bool (*assign_vips)(listener_t *this, ike_sa_t *ike_sa, bool assign);
+
+	/**
+	 * Virtual IP and configuration attribute handler hook.
+	 *
+	 * This hook gets invoked after virtual IP and other configuration
+	 * attributes just got installed or are about to get uninstalled on a peer
+	 * receiving them.
+	 *
+	 * @param ike_sa	IKE_SA the VIPs/attributes are handled on
+	 * @param handle	TRUE if handled by IKE_SA, FALSE on release
+	 * @return			TRUE to stay registered, FALSE to unregister
+	 */
+	bool (*handle_vips)(listener_t *this, ike_sa_t *ike_sa, bool handle);
 };
 
 #endif /** LISTENER_H_ @}*/

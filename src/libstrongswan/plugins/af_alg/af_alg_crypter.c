@@ -61,7 +61,7 @@ static struct {
 	/* size of the keying material (key + nonce for ctr mode) */
 	size_t keymat_size;
 	size_t iv_size;
-} algs[] = {
+} algs[AF_ALG_CRYPTER] = {
 	{ENCR_DES,			"cbc(des)",					 8,	 8,	 8,	 8,	},
 	{ENCR_DES_ECB,		"ecb(des)",					 8,	 8,	 8,	 0,	},
 	{ENCR_3DES,			"cbc(des3_ede)",			 8,	24,	24,	 8,	},
@@ -92,25 +92,20 @@ static struct {
 /**
  * See header.
  */
-void af_alg_crypter_probe(char *plugin)
+void af_alg_crypter_probe(plugin_feature_t *features, int *pos)
 {
-	encryption_algorithm_t prev = -1;
 	af_alg_ops_t *ops;
 	int i;
 
 	for (i = 0; i < countof(algs); i++)
 	{
-		if (prev != algs[i].id)
+		ops = af_alg_ops_create("skcipher", algs[i].name);
+		if (ops)
 		{
-			ops = af_alg_ops_create("skcipher", algs[i].name);
-			if (ops)
-			{
-				ops->destroy(ops);
-				lib->crypto->add_crypter(lib->crypto, algs[i].id, plugin,
-								(crypter_constructor_t)af_alg_crypter_create);
-			}
+			ops->destroy(ops);
+			features[(*pos)++] = PLUGIN_PROVIDE(CRYPTER,
+												algs[i].id, algs[i].key_size);
 		}
-		prev = algs[i].id;
 	}
 }
 
@@ -136,32 +131,26 @@ static size_t lookup_alg(encryption_algorithm_t algo, char **name,
 	return 0;
 }
 
-METHOD(crypter_t, decrypt, void,
+METHOD(crypter_t, decrypt, bool,
 	private_af_alg_crypter_t *this, chunk_t data, chunk_t iv, chunk_t *dst)
 {
 	if (dst)
 	{
 		*dst = chunk_alloc(data.len);
-		this->ops->crypt(this->ops, ALG_OP_DECRYPT, iv, data, dst->ptr);
+		return this->ops->crypt(this->ops, ALG_OP_DECRYPT, iv, data, dst->ptr);
 	}
-	else
-	{
-		this->ops->crypt(this->ops, ALG_OP_DECRYPT, iv, data, data.ptr);
-	}
+	return this->ops->crypt(this->ops, ALG_OP_DECRYPT, iv, data, data.ptr);
 }
 
-METHOD(crypter_t, encrypt, void,
+METHOD(crypter_t, encrypt, bool,
 	private_af_alg_crypter_t *this, chunk_t data, chunk_t iv, chunk_t *dst)
 {
 	if (dst)
 	{
 		*dst = chunk_alloc(data.len);
-		this->ops->crypt(this->ops, ALG_OP_ENCRYPT, iv, data, dst->ptr);
+		return this->ops->crypt(this->ops, ALG_OP_ENCRYPT, iv, data, dst->ptr);
 	}
-	else
-	{
-		this->ops->crypt(this->ops, ALG_OP_ENCRYPT, iv, data, data.ptr);
-	}
+	return this->ops->crypt(this->ops, ALG_OP_ENCRYPT, iv, data, data.ptr);
 }
 
 METHOD(crypter_t, get_block_size, size_t,
@@ -182,10 +171,10 @@ METHOD(crypter_t, get_key_size, size_t,
 	return this->keymat_size;
 }
 
-METHOD(crypter_t, set_key, void,
+METHOD(crypter_t, set_key, bool,
 	private_af_alg_crypter_t *this, chunk_t key)
 {
-	this->ops->set_key(this->ops, key);
+	return this->ops->set_key(this->ops, key);
 }
 
 METHOD(crypter_t, destroy, void,

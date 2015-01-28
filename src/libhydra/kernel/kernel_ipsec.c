@@ -15,23 +15,23 @@
 
 #include "kernel_ipsec.h"
 
-ENUM(ipsec_mode_names, MODE_TRANSPORT, MODE_BEET,
-	"TRANSPORT",
-	"TUNNEL",
-	"BEET",
-);
+#include <hydra.h>
 
-ENUM(policy_dir_names, POLICY_IN, POLICY_FWD,
-	"in",
-	"out",
-	"fwd"
-);
-
-ENUM(ipcomp_transform_names, IPCOMP_NONE, IPCOMP_LZJH,
-	"IPCOMP_NONE",
-	"IPCOMP_OUI",
-	"IPCOMP_DEFLATE",
-	"IPCOMP_LZS",
-	"IPCOMP_LZJH"
-);
-
+/**
+ * See header
+ */
+bool kernel_ipsec_register(plugin_t *plugin, plugin_feature_t *feature,
+						   bool reg, void *data)
+{
+	if (reg)
+	{
+		hydra->kernel_interface->add_ipsec_interface(hydra->kernel_interface,
+											(kernel_ipsec_constructor_t)data);
+	}
+	else
+	{
+		hydra->kernel_interface->remove_ipsec_interface(hydra->kernel_interface,
+											(kernel_ipsec_constructor_t)data);
+	}
+	return TRUE;
+}

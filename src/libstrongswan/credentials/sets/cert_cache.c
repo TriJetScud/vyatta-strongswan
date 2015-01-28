@@ -16,11 +16,10 @@
 #include "cert_cache.h"
 
 #include <time.h>
-#include <sched.h>
 
 #include <library.h>
 #include <threading/rwlock.h>
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 
 /** cache size, a power of 2 for fast modulo */
 #define CACHE_SIZE 32
@@ -45,6 +44,11 @@ struct relation_t {
 	 * issuer of this relation
 	 */
 	certificate_t *issuer;
+
+	/**
+	 * Signature scheme used to sign this relation
+	 */
+	signature_scheme_t scheme;
 
 	/**
 	 * Cache hits
@@ -77,7 +81,8 @@ struct private_cert_cache_t {
  * Cache relation in a free slot/replace an other
  */
 static void cache(private_cert_cache_t *this,
-				  certificate_t *subject, certificate_t *issuer)
+				  certificate_t *subject, certificate_t *issuer,
+				  signature_scheme_t scheme)
 {
 	relation_t *rel;
 	int i, offset, try;
@@ -95,6 +100,7 @@ static void cache(private_cert_cache_t *this,
 			{
 				rel->subject = subject->get_ref(subject);
 				rel->issuer = issuer->get_ref(issuer);
+				rel->scheme = scheme;
 				return rel->lock->unlock(rel->lock);
 			}
 			rel->lock->unlock(rel->lock);
@@ -123,6 +129,7 @@ static void cache(private_cert_cache_t *this,
 				}
 				rel->subject = subject->get_ref(subject);
 				rel->issuer = issuer->get_ref(issuer);
+				rel->scheme = scheme;
 				rel->hits = 0;
 				return rel->lock->unlock(rel->lock);
 			}
@@ -132,13 +139,13 @@ static void cache(private_cert_cache_t *this,
 	}
 }
 
-/**
- * Implementation of cert_cache_t.issued_by.
- */
-static bool issued_by(private_cert_cache_t *this,
-					  certificate_t *subject, certificate_t *issuer)
+METHOD(cert_cache_t, issued_by, bool,
+	private_cert_cache_t *this, certificate_t *subject, certificate_t *issuer,
+	signature_scheme_t *schemep)
 {
+	certificate_t *cached_issuer = NULL;
 	relation_t *found = NULL, *current;
+	signature_scheme_t scheme;
 	int i;
 
 	for (i = 0; i < CACHE_SIZE; i++)
@@ -148,31 +155,41 @@ static bool issued_by(private_cert_cache_t *this,
 		current->lock->read_lock(current->lock);
 		if (current->subject)
 		{
-			/* check for equal issuer */
 			if (issuer->equals(issuer, current->issuer))
 			{
-				/* reuse issuer instance in cache() */
-				issuer = current->issuer;
 				if (subject->equals(subject, current->subject))
 				{
-					/* write hit counter is not locked, but not critical */
 					current->hits++;
 					found = current;
+					if (schemep)
+					{
+						*schemep = current->scheme;
+					}
+				}
+				else if (!cached_issuer)
+				{
+					cached_issuer = current->issuer->get_ref(current->issuer);
 				}
 			}
 		}
 		current->lock->unlock(current->lock);
 		if (found)
 		{
+			DESTROY_IF(cached_issuer);
 			return TRUE;
 		}
 	}
-	/* no cache hit, check and cache signature */
-	if (subject->issued_by(subject, issuer))
+	if (subject->issued_by(subject, issuer, &scheme))
 	{
-		cache(this, subject, issuer);
+		cache(this, subject, cached_issuer ?: issuer, scheme);
+		if (schemep)
+		{
+			*schemep = scheme;
+		}
+		DESTROY_IF(cached_issuer);
 		return TRUE;
 	}
+	DESTROY_IF(cached_issuer);
 	return FALSE;
 }
 
@@ -270,12 +287,9 @@ static void cert_enumerator_destroy(cert_enumerator_t *this)
 	free(this);
 }
 
-/**
- * implementation of credential_set_t.create_cert_enumerator
- */
-static enumerator_t *create_enumerator(private_cert_cache_t *this,
-									   certificate_type_t cert, key_type_t key,
-									   identification_t *id, bool trusted)
+METHOD(credential_set_t, create_enumerator, enumerator_t*,
+	private_cert_cache_t *this, certificate_type_t cert, key_type_t key,
+	identification_t *id, bool trusted)
 {
 	cert_enumerator_t *enumerator;
 
@@ -296,10 +310,8 @@ static enumerator_t *create_enumerator(private_cert_cache_t *this,
 	return &enumerator->public;
 }
 
-/**
- * Implementation of cert_cache_t.flush.
- */
-static void flush(private_cert_cache_t *this, certificate_type_t type)
+METHOD(cert_cache_t, flush, void,
+	private_cert_cache_t *this, certificate_type_t type)
 {
 	relation_t *rel;
 	int i;
@@ -339,10 +351,8 @@ static void flush(private_cert_cache_t *this, certificate_type_t type)
 	}
 }
 
-/**
- * Implementation of cert_cache_t.destroy
- */
-static void destroy(private_cert_cache_t *this)
+METHOD(cert_cache_t, destroy, void,
+	private_cert_cache_t *this)
 {
 	relation_t *rel;
 	int i;
@@ -368,15 +378,20 @@ cert_cache_t *cert_cache_create()
 	private_cert_cache_t *this;
 	int i;
 
-	this = malloc_thing(private_cert_cache_t);
-	this->public.set.create_private_enumerator = (void*)return_null;
-	this->public.set.create_cert_enumerator = (void*)create_enumerator;
-	this->public.set.create_shared_enumerator = (void*)return_null;
-	this->public.set.create_cdp_enumerator = (void*)return_null;
-	this->public.set.cache_cert = (void*)nop;
-	this->public.issued_by = (bool(*)(cert_cache_t*, certificate_t *subject, certificate_t *issuer))issued_by;
-	this->public.flush = (void(*)(cert_cache_t*, certificate_type_t type))flush;
-	this->public.destroy = (void(*)(cert_cache_t*))destroy;
+	INIT(this,
+		.public = {
+			.set = {
+				.create_cert_enumerator = _create_enumerator,
+				.create_private_enumerator = (void*)return_null,
+				.create_shared_enumerator = (void*)return_null,
+				.create_cdp_enumerator = (void*)return_null,
+				.cache_cert = (void*)nop,
+			},
+			.issued_by = _issued_by,
+			.flush = _flush,
+			.destroy = _destroy,
+		},
+	);
 
 	for (i = 0; i < CACHE_SIZE; i++)
 	{
@@ -385,5 +400,6 @@ cert_cache_t *cert_cache_create()
 		this->relations[i].hits = 0;
 		this->relations[i].lock = rwlock_create(RWLOCK_TYPE_DEFAULT);
 	}
+
 	return &this->public;
 }

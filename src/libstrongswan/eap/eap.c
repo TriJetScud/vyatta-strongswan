@@ -1,4 +1,5 @@
 /*
+ * Copyright (C) 2012 Tobias Brunner
  * Copyright (C) 2006 Martin Willi
  * Hochschule fuer Technik Rapperswil
  *
@@ -13,7 +14,12 @@
  * for more details.
  */
 
+#include <stdlib.h>
+#include <errno.h>
+
 #include "eap.h"
+
+#include <utils/debug.h>
 
 ENUM(eap_code_names, EAP_REQUEST, EAP_FAILURE,
 	"EAP_REQUEST",
@@ -51,12 +57,14 @@ ENUM_NEXT(eap_type_names, EAP_MSTLV, EAP_MSTLV, EAP_MSCHAPV2,
 	"EAP_MSTLV");
 ENUM_NEXT(eap_type_names, EAP_TNC, EAP_TNC, EAP_MSTLV,
 	"EAP_TNC");
-ENUM_NEXT(eap_type_names, EAP_DYNAMIC, EAP_EXPERIMENTAL, EAP_TNC,
-	"EAP_DYNAMIC",
-	"EAP_RADIUS",
+ENUM_NEXT(eap_type_names, EAP_PT_EAP, EAP_PT_EAP, EAP_TNC,
+	"EAP_PT_EAP");
+ENUM_NEXT(eap_type_names, EAP_EXPANDED, EAP_DYNAMIC, EAP_PT_EAP,
 	"EAP_EXPANDED",
-	"EAP_EXPERIMENTAL");
-ENUM_END(eap_type_names, EAP_EXPERIMENTAL);
+	"EAP_EXPERIMENTAL",
+	"EAP_RADIUS",
+	"EAP_DYNAMIC");
+ENUM_END(eap_type_names, EAP_DYNAMIC);
 
 ENUM_BEGIN(eap_type_short_names, EAP_IDENTITY, EAP_GTC,
 	"ID",
@@ -80,30 +88,14 @@ ENUM_NEXT(eap_type_short_names, EAP_MSTLV, EAP_MSTLV, EAP_MSCHAPV2,
 	"MSTLV");
 ENUM_NEXT(eap_type_short_names, EAP_TNC, EAP_TNC, EAP_MSTLV,
 	"TNC");
-ENUM_NEXT(eap_type_short_names, EAP_DYNAMIC, EAP_EXPERIMENTAL, EAP_TNC,
-	"DYN",
-	"RAD",
+ENUM_NEXT(eap_type_short_names, EAP_PT_EAP, EAP_PT_EAP, EAP_TNC,
+	"PT");
+ENUM_NEXT(eap_type_short_names, EAP_EXPANDED, EAP_DYNAMIC, EAP_PT_EAP,
 	"EXP",
-	"XP");
-ENUM_END(eap_type_short_names, EAP_EXPERIMENTAL);
-
-ENUM(auth_rule_names, AUTH_RULE_IDENTITY, AUTH_HELPER_SUBJECT_HASH_URL,
-	"RULE_IDENTITY",
-	"RULE_AUTH_CLASS",
-	"RULE_EAP_IDENTITY",
-	"RULE_EAP_TYPE",
-	"RULE_EAP_VENDOR",
-	"RULE_CA_CERT",
-	"RULE_IM_CERT",
-	"RULE_SUBJECT_CERT",
-	"RULE_CRL_VALIDATION",
-	"RULE_OCSP_VALIDATION",
-	"RULE_GROUP",
-	"HELPER_IM_CERT",
-	"HELPER_SUBJECT_CERT",
-	"HELPER_IM_HASH_URL",
-	"HELPER_SUBJECT_HASH_URL",
-);
+	"XP",
+	"RAD",
+	"DYN");
+ENUM_END(eap_type_short_names, EAP_DYNAMIC);
 
 /*
  * See header
@@ -126,6 +118,8 @@ eap_type_t eap_type_from_string(char *name)
 		{"peap",		EAP_PEAP},
 		{"mschapv2",	EAP_MSCHAPV2},
 		{"tnc",			EAP_TNC},
+		{"pt",			EAP_PT_EAP},
+		{"dynamic",		EAP_DYNAMIC},
 		{"radius",		EAP_RADIUS},
 	};
 
@@ -137,4 +131,57 @@ eap_type_t eap_type_from_string(char *name)
 		}
 	}
 	return 0;
+}
+
+/*
+ * See header
+ */
+eap_vendor_type_t *eap_vendor_type_from_string(char *str)
+{
+	enumerator_t *enumerator;
+	eap_vendor_type_t *result = NULL;
+	eap_type_t type = 0;
+	uint32_t vendor = 0;
+	char *part, *end;
+
+	/* parse EAP method string of the form: [eap-]type[-vendor] */
+	enumerator = enumerator_create_token(str, "-", " ");
+	while (enumerator->enumerate(enumerator, &part))
+	{
+		if (!type)
+		{
+			if (streq(part, "eap"))
+			{	/* skip 'eap' at the beginning */
+				continue;
+			}
+			type = eap_type_from_string(part);
+			if (!type)
+			{
+				type = strtoul(part, &end, 0);
+				if (*end != '\0' || errno)
+				{
+					DBG1(DBG_LIB, "unknown or invalid EAP method: %s", part);
+					break;
+				}
+			}
+			continue;
+		}
+		vendor = strtoul(part, &end, 0);
+		if (*end != '\0' || errno)
+		{
+			DBG1(DBG_LIB, "invalid EAP vendor: %s", part);
+			type = 0;
+		}
+		break;
+	}
+	enumerator->destroy(enumerator);
+
+	if (type)
+	{
+		INIT(result,
+			.type = type,
+			.vendor = vendor,
+		);
+	}
+	return result;
 }

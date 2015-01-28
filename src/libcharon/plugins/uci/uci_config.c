@@ -87,28 +87,12 @@ static traffic_selector_t *create_ts(char *string)
 {
 	if (string)
 	{
-		int netbits = 32;
-		host_t *net;
-		char *pos;
+		traffic_selector_t *ts;
 
-		string = strdupa(string);
-		pos = strchr(string, '/');
-		if (pos)
+		ts = traffic_selector_create_from_cidr(string, 0, 0, 65535);
+		if (ts)
 		{
-			*pos++ = '\0';
-			netbits = atoi(pos);
-		}
-		else
-		{
-			if (strchr(string, ':'))
-			{
-				netbits = 128;
-			}
-		}
-		net = host_create_from_string(string, 0);
-		if (net)
-		{
-			return traffic_selector_create_from_subnet(net, netbits, 0, 0);
+			return ts;
 		}
 	}
 	return traffic_selector_create_dynamic(0, 0, 65535);
@@ -133,10 +117,8 @@ static u_int create_rekey(char *string)
 	return 12 * 3600;
 }
 
-/**
- * Implementation of peer_enumerator_t.public.enumerate
- */
-static bool peer_enumerator_enumerate(peer_enumerator_t *this, peer_cfg_t **cfg)
+METHOD(enumerator_t, peer_enumerator_enumerate, bool,
+	peer_enumerator_t *this, peer_cfg_t **cfg)
 {
 	char *name, *ike_proposal, *esp_proposal, *ike_rekey, *esp_rekey;
 	char *local_id, *local_addr, *local_net;
@@ -170,16 +152,18 @@ static bool peer_enumerator_enumerate(peer_enumerator_t *this, peer_cfg_t **cfg)
 			&ike_proposal, &esp_proposal, &ike_rekey, &esp_rekey))
 	{
 		DESTROY_IF(this->peer_cfg);
-		ike_cfg = ike_cfg_create(FALSE, FALSE,
-					local_addr, IKEV2_UDP_PORT, remote_addr, IKEV2_UDP_PORT);
+		ike_cfg = ike_cfg_create(IKEV2, FALSE, FALSE, local_addr,
+								 charon->socket->get_port(charon->socket, FALSE),
+								 remote_addr, IKEV2_UDP_PORT,
+								 FRAGMENTATION_NO, 0);
 		ike_cfg->add_proposal(ike_cfg, create_proposal(ike_proposal, PROTO_IKE));
 		this->peer_cfg = peer_cfg_create(
-					name, 2, ike_cfg, CERT_SEND_IF_ASKED, UNIQUE_NO,
+					name, ike_cfg, CERT_SEND_IF_ASKED, UNIQUE_NO,
 					1, create_rekey(ike_rekey), 0,  /* keytries, rekey, reauth */
 					1800, 900,						/* jitter, overtime */
-					TRUE, 60, 						/* mobike, dpddelay */
-					NULL, NULL, 					/* vip, pool */
-					FALSE, NULL, NULL); 			/* mediation, med by, peer id */
+					TRUE, FALSE, TRUE,			/* mobike, aggressive, pull */
+					60, 0,						/* DPD delay, timeout */
+					FALSE, NULL, NULL);			/* mediation, med by, peer id */
 		auth = auth_cfg_create();
 		auth->add(auth, AUTH_RULE_AUTH_CLASS, AUTH_CLASS_PSK);
 		auth->add(auth, AUTH_RULE_IDENTITY,
@@ -208,32 +192,30 @@ static bool peer_enumerator_enumerate(peer_enumerator_t *this, peer_cfg_t **cfg)
 	return FALSE;
 }
 
-/**
- * Implementation of peer_enumerator_t.public.destroy
- */
-static void peer_enumerator_destroy(peer_enumerator_t *this)
+
+METHOD(enumerator_t, peer_enumerator_destroy, void,
+	peer_enumerator_t *this)
 {
 	DESTROY_IF(this->peer_cfg);
 	this->inner->destroy(this->inner);
 	free(this);
 }
 
-/**
- * Implementation of backend_t.create_peer_cfg_enumerator.
- */
-static enumerator_t* create_peer_cfg_enumerator(private_uci_config_t *this,
-												identification_t *me,
-												identification_t *other)
+METHOD(backend_t, create_peer_cfg_enumerator, enumerator_t*,
+	private_uci_config_t *this, identification_t *me, identification_t *other)
 {
-	peer_enumerator_t *e = malloc_thing(peer_enumerator_t);
+	peer_enumerator_t *e;
 
-	e->public.enumerate = (void*)peer_enumerator_enumerate;
-	e->public.destroy = (void*)peer_enumerator_destroy;
-	e->peer_cfg = NULL;
-	e->inner = this->parser->create_section_enumerator(this->parser,
+	INIT(e,
+		.public = {
+			.enumerate = (void*)_peer_enumerator_enumerate,
+			.destroy = _peer_enumerator_destroy,
+		},
+		.inner = this->parser->create_section_enumerator(this->parser,
 					"local_id", "remote_id", "local_addr", "remote_addr",
 					"local_net", "remote_net", "ike_proposal", "esp_proposal",
-					"ike_rekey", "esp_rekey", NULL);
+					"ike_rekey", "esp_rekey", NULL),
+	);
 	if (!e->inner)
 	{
 		free(e);
@@ -254,10 +236,8 @@ typedef struct {
 	enumerator_t *inner;
 } ike_enumerator_t;
 
-/**
- * Implementation of peer_enumerator_t.public.enumerate
- */
-static bool ike_enumerator_enumerate(ike_enumerator_t *this, ike_cfg_t **cfg)
+METHOD(enumerator_t, ike_enumerator_enumerate, bool,
+	ike_enumerator_t *this, ike_cfg_t **cfg)
 {
 	char *local_addr, *remote_addr, *ike_proposal;
 
@@ -270,8 +250,10 @@ static bool ike_enumerator_enumerate(ike_enumerator_t *this, ike_cfg_t **cfg)
 							   &local_addr, &remote_addr, &ike_proposal))
 	{
 		DESTROY_IF(this->ike_cfg);
-		this->ike_cfg = ike_cfg_create(FALSE, FALSE, local_addr, IKEV2_UDP_PORT,
-										remote_addr, IKEV2_UDP_PORT);
+		this->ike_cfg = ike_cfg_create(IKEV2, FALSE, FALSE, local_addr,
+								charon->socket->get_port(charon->socket, FALSE),
+								remote_addr, IKEV2_UDP_PORT,
+								FRAGMENTATION_NO, 0);
 		this->ike_cfg->add_proposal(this->ike_cfg,
 									create_proposal(ike_proposal, PROTO_IKE));
 
@@ -281,29 +263,27 @@ static bool ike_enumerator_enumerate(ike_enumerator_t *this, ike_cfg_t **cfg)
 	return FALSE;
 }
 
-/**
- * Implementation of ike_enumerator_t.public.destroy
- */
-static void ike_enumerator_destroy(ike_enumerator_t *this)
+METHOD(enumerator_t, ike_enumerator_destroy, void,
+	ike_enumerator_t *this)
 {
 	DESTROY_IF(this->ike_cfg);
 	this->inner->destroy(this->inner);
 	free(this);
 }
 
-/**
- * Implementation of backend_t.create_ike_cfg_enumerator.
- */
-static enumerator_t* create_ike_cfg_enumerator(private_uci_config_t *this,
-											   host_t *me, host_t *other)
+METHOD(backend_t, create_ike_cfg_enumerator, enumerator_t*,
+	private_uci_config_t *this, host_t *me, host_t *other)
 {
-	ike_enumerator_t *e = malloc_thing(ike_enumerator_t);
+	ike_enumerator_t *e;
 
-	e->public.enumerate = (void*)ike_enumerator_enumerate;
-	e->public.destroy = (void*)ike_enumerator_destroy;
-	e->ike_cfg = NULL;
-	e->inner = this->parser->create_section_enumerator(this->parser,
-							"local_addr", "remote_addr", "ike_proposal", NULL);
+	INIT(e,
+		.public = {
+			.enumerate = (void*)_ike_enumerator_enumerate,
+			.destroy = _ike_enumerator_destroy,
+		},
+		.inner = this->parser->create_section_enumerator(this->parser,
+							"local_addr", "remote_addr", "ike_proposal", NULL),
+	);
 	if (!e->inner)
 	{
 		free(e);
@@ -312,10 +292,8 @@ static enumerator_t* create_ike_cfg_enumerator(private_uci_config_t *this,
 	return &e->public;
 }
 
-/**
- * implements backend_t.get_peer_cfg_by_name.
- */
-static peer_cfg_t *get_peer_cfg_by_name(private_uci_config_t *this, char *name)
+METHOD(backend_t, get_peer_cfg_by_name, peer_cfg_t*,
+	private_uci_config_t *this, char *name)
 {
 	enumerator_t *enumerator;
 	peer_cfg_t *current, *found = NULL;
@@ -336,10 +314,8 @@ static peer_cfg_t *get_peer_cfg_by_name(private_uci_config_t *this, char *name)
 	return found;
 }
 
-/**
- * Implementation of uci_config_t.destroy.
- */
-static void destroy(private_uci_config_t *this)
+METHOD(uci_config_t, destroy, void,
+	private_uci_config_t *this)
 {
 	free(this);
 }
@@ -349,14 +325,19 @@ static void destroy(private_uci_config_t *this)
  */
 uci_config_t *uci_config_create(uci_parser_t *parser)
 {
-	private_uci_config_t *this = malloc_thing(private_uci_config_t);
+	private_uci_config_t *this;
 
-	this->public.backend.create_peer_cfg_enumerator = (enumerator_t*(*)(backend_t*, identification_t *me, identification_t *other))create_peer_cfg_enumerator;
-	this->public.backend.create_ike_cfg_enumerator = (enumerator_t*(*)(backend_t*, host_t *me, host_t *other))create_ike_cfg_enumerator;
-	this->public.backend.get_peer_cfg_by_name = (peer_cfg_t* (*)(backend_t*,char*))get_peer_cfg_by_name;
-	this->public.destroy = (void(*)(uci_config_t*))destroy;
-	this->parser = parser;
+	INIT(this,
+		.public = {
+			.backend = {
+				.create_peer_cfg_enumerator = _create_peer_cfg_enumerator,
+				.create_ike_cfg_enumerator = _create_ike_cfg_enumerator,
+				.get_peer_cfg_by_name = _get_peer_cfg_by_name,
+			},
+			.destroy = _destroy,
+		},
+		.parser = parser,
+	);
 
 	return &this->public;
 }
-

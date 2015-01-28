@@ -35,24 +35,60 @@ typedef struct tls_socket_t tls_socket_t;
 struct tls_socket_t {
 
 	/**
-	 * Read data from secured socket, return allocated chunk.
+	 * Read data from secured socket.
 	 *
 	 * This call is blocking, you may use select() on the underlying socket to
-	 * wait for data. If the there was non-application data available, the
-	 * read function can return an empty chunk.
+	 * wait for data. If "block" is FALSE and no application data is available,
+	 * the function returns -1 and sets errno to EWOULDBLOCK.
 	 *
-	 * @param data		pointer to allocate received data
-	 * @return			TRUE if data received successfully
+	 * @param buf		buffer to write received data to
+	 * @param len		size of buffer
+	 * @param block		TRUE to block this call, FALSE to fail if it would block
+	 * @return			number of bytes read, 0 on EOF, -1 on error
 	 */
-	bool (*read)(tls_socket_t *this, chunk_t *data);
+	ssize_t (*read)(tls_socket_t *this, void *buf, size_t len, bool block);
 
 	/**
-	 * Write a chunk of data over the secured socket.
+	 * Write data over the secured socket.
 	 *
-	 * @param data		data to send
-	 * @return			TRUE if data sent successfully
+	 * @param buf		data to send
+	 * @param len		number of bytes to write from buf
+	 * @return			number of bytes written, -1 on error
 	 */
-	bool (*write)(tls_socket_t *this, chunk_t data);
+	ssize_t (*write)(tls_socket_t *this, void *buf, size_t len);
+
+	/**
+	 * Read/write plain data from file descriptor.
+	 *
+	 * This call is blocking, but a thread cancellation point. Data is
+	 * exchanged until one of the sockets gets closed or an error occurs.
+	 *
+	 * @param rfd		file descriptor to read plain data from
+	 * @param wfd		file descriptor to write plain data to
+	 * @return			TRUE if data exchanged successfully
+	 */
+	bool (*splice)(tls_socket_t *this, int rfd, int wfd);
+
+	/**
+	 * Get the underlying file descriptor passed to the constructor.
+	 *
+	 * @return			file descriptor
+	 */
+	int (*get_fd)(tls_socket_t *this);
+
+	/**
+	 * Return the server identity.
+	 *
+	 * @return			server identity
+	 */
+	identification_t* (*get_server_id)(tls_socket_t *this);
+
+	/**
+	 * Return the peer identity.
+	 *
+	 * @return			peer identity
+	 */
+	identification_t* (*get_peer_id)(tls_socket_t *this);
 
 	/**
 	 * Destroy a tls_socket_t.
@@ -67,9 +103,13 @@ struct tls_socket_t {
  * @param server			server identity
  * @param peer				client identity, NULL for no client authentication
  * @param fd				socket to read/write from
+ * @param cache				session cache to use, or NULL
+ * @param max_version		maximun TLS version to negotiate
+ * @param nullok			accept NULL encryption ciphers
  * @return					TLS socket wrapper
  */
 tls_socket_t *tls_socket_create(bool is_server, identification_t *server,
-								identification_t *peer, int fd);
+							identification_t *peer, int fd, tls_cache_t *cache,
+							tls_version_t max_version, bool nullok);
 
 #endif /** TLS_SOCKET_H_ @}*/

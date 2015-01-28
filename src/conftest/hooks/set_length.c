@@ -50,9 +50,9 @@ struct private_set_length_t {
 
 METHOD(listener_t, message, bool,
 	private_set_length_t *this, ike_sa_t *ike_sa, message_t *message,
-	bool incoming)
+	bool incoming, bool plain)
 {
-	if (!incoming &&
+	if (!incoming && plain &&
 		message->get_request(message) == this->req &&
 		message->get_message_id(message) == this->id)
 	{
@@ -63,8 +63,7 @@ METHOD(listener_t, message, bool,
 		type = atoi(this->type);
 		if (!type)
 		{
-			type = enum_from_name(payload_type_short_names, this->type);
-			if (type == -1)
+			if (!enum_from_name(payload_type_short_names, this->type, &type))
 			{
 				DBG1(DBG_CFG, "unknown payload: '%s', skipped", this->type);
 				return TRUE;
@@ -76,11 +75,10 @@ METHOD(listener_t, message, bool,
 			if (type == payload->get_type(payload))
 			{
 				encoding_rule_t *rules;
-				size_t count;
 				u_int16_t *len;
-				int i;
+				int i, count;
 
-				payload->get_encoding_rules(payload, &rules, &count);
+				count = payload->get_encoding_rules(payload, &rules);
 				for (i = 0; i < count; i++)
 				{
 					if (rules[i].type == PAYLOAD_LENGTH)

@@ -15,9 +15,9 @@
 
 #include "fetcher_manager.h"
 
-#include <debug.h>
+#include <utils/debug.h>
 #include <threading/rwlock.h>
-#include <utils/linked_list.h>
+#include <collections/linked_list.h>
 
 typedef struct private_fetcher_manager_t private_fetcher_manager_t;
 
@@ -43,7 +43,7 @@ struct private_fetcher_manager_t {
 };
 
 typedef struct {
-	/** assocaited fetcher construction function */
+	/** associated fetcher construction function */
 	fetcher_constructor_t create;
 	/** URL this fetcher support */
 	char *url;
@@ -73,6 +73,7 @@ METHOD(fetcher_manager_t, fetch, status_t,
 		fetcher_option_t opt;
 		fetcher_t *fetcher;
 		bool good = TRUE;
+		host_t *host;
 		va_list args;
 
 		/* check URL support of fetcher */
@@ -111,6 +112,18 @@ METHOD(fetcher_manager_t, fetch, status_t,
 				case FETCH_CALLBACK:
 					good = fetcher->set_option(fetcher, opt,
 											va_arg(args, fetcher_callback_t));
+					continue;
+				case FETCH_RESPONSE_CODE:
+					good = fetcher->set_option(fetcher, opt,
+											va_arg(args, u_int*));
+					continue;
+				case FETCH_SOURCEIP:
+					host = va_arg(args, host_t*);
+					if (host && !host->is_anyaddr(host))
+					{
+						good = fetcher->set_option(fetcher, opt, host);
+					}
+					continue;
 				case FETCH_END:
 					break;
 			}
@@ -204,4 +217,3 @@ fetcher_manager_t *fetcher_manager_create()
 
 	return &this->public;
 }
-
