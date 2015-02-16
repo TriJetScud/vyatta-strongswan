@@ -37,3 +37,4 @@ usr/lib/strongswan/plugins/libstrongswan-dhcp.so*				usr/lib/strongswan/plugins/
 usr/lib/strongswan/plugins/libstrongswan-farp.so*				usr/lib/strongswan/plugins/
 usr/lib/strongswan/plugins/libstrongswan-attr.so*				usr/lib/strongswan/plugins/
 usr/lib/strongswan/plugins/libstrongswan-resolve.so*			usr/lib/strongswan/plugins/
+usr/lib/strongswan/plugins/libstrongswan-sql.so*			usr/lib/strongswan/plugins/
