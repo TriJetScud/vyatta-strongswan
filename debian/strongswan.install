@@ -5,6 +5,7 @@ usr/lib/strongswan/_copyright									usr/lib/strongswan/
 usr/lib/strongswan/pool											usr/lib/strongswan/
 usr/lib/strongswan/libradius.so*								usr/lib/strongswan/
 usr/sbin/ipsec													usr/sbin/
+usr/sbin/swanctl												usr/sbin/
 etc/ipsec.conf													etc/
 etc/ipsec.d														etc/
 etc/ipsec.d/reqs												etc/ipsec.d/

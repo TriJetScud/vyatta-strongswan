@@ -2,7 +2,6 @@
 
 #export DH_VERBOSE=1
 
-CC = gcc
 CFLAGS = -Wall -Wno-format -Wno-pointer-sign -g
 CONFIGURE_ARGS = \
 	--prefix=/usr --libexecdir=/usr/lib --sysconfdir=/etc --enable-curl \
@@ -13,7 +12,8 @@ CONFIGURE_ARGS = \
 	--enable-pkcs11 --enable-ctr --enable-ccm --enable-gcm --enable-addrblock \
 	--disable-hmac --with-capabilities=libcap --enable-sql \
 	--with-ipsecdir=/usr/lib/strongswan --with-ipseclibdir=/usr/lib/strongswan \
-	--with-dev-headers=/usr/include/strongswan --enable-unity
+	--with-dev-headers=/usr/include/strongswan --enable-unity --enable-vici \
+	--enable-swanctl 
 
 ifeq (,$(filter noopt,$(DEB_BUILD_OPTIONS)))
 	CFLAGS += -O2
